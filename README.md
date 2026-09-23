@@ -81,7 +81,7 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
 ## Fronttest (paper trading, live)
 
-`fronttest.py` (backend) + `fronttest.html` (UI) trade #7b on live Binance data with $10,000 of fake money.
+`fronttest.py` (backend) + `fronttest.html` (UI) trade #7b on live Binance data with $1,000 of fake money.
 Data feed: one websocket (`wss://fstream.binance.com/market/ws/!markPrice@arr`) gives mark prices and funding
 times for all perps, with 0 REST weight. REST is used only for (a) the daily signal at 00:05 UTC (~80 weight), (b) one
 `/fapi/v1/fundingRate` call per held coin right after each settlement (separate 500/5min limit), and (c) mark prices while the
