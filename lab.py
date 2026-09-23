@@ -155,6 +155,18 @@ def adx(h, l, c, n):
     return w(dx)
 
 
+def pct_rank(s, win=365, minp=180):
+    """Trailing percentile of today's value among the previous values in the last `win` days (0..1)."""
+    return s.rolling(win, min_periods=minp).apply(lambda a: (a[:-1] < a[-1]).mean(), raw=True)
+
+
+def atr_pct(h, l, c, n=14):
+    """Wilder ATR as a fraction of price."""
+    pc = c.shift(1)
+    tr = np.maximum(h - l, np.maximum((h - pc).abs(), (l - pc).abs()))
+    return tr.ewm(alpha=1 / n, adjust=False, min_periods=n).mean() / c
+
+
 def hold(entry, exit_):
     """Stateful long flag: 1 from an entry bar until an exit bar (entry wins ties)."""
     s = pd.DataFrame(np.nan, index=entry.index, columns=entry.columns)

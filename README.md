@@ -147,5 +147,10 @@ scp fronttest-copy.db server:/opt/reddit-ideas/fronttest.db
 
 It continues from the same state. Funding paid while it was stopped is booked on the next start.
 The UI has no login, so keep `FRONTTEST_HOST=127.0.0.1` on a server and reach it with `ssh -L 8770:127.0.0.1:8770 server`.
+**Market filter.** Live: flat when BTC's 14d ATR% is in the low third of its last 365 days (`regime.py`: OOS Sharpe 0.93 → 1.07,
+max DD −61% → −38%, 31 separate off-episodes). Shadow (logged, not applied): BTC close/SMA200 in the top third of its last year;
+its backtest benefit comes almost entirely from one episode (the Oct 2023 – Apr 2024 ETF rally), so it has to earn its place live.
+Both values are in the `filters` table and match the backtest values exactly on 2025-03-10, 2026-08-20 and 2026-08-30.
+
 Differences from the backtest: rebalances to target from actual holdings (includes drift, so turnover is a bit higher);
 fills at mark price with flat 7 bps (no order book). The first rebalance happened mid-day (2026-09-23 17:41 UTC) on the 09-22 signal.

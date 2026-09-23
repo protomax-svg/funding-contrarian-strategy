@@ -20,15 +20,11 @@ IS = slice(None, lab.SPLIT - pd.Timedelta("1ns"))
 OOS = slice(lab.SPLIT, None)
 
 
-def pct_rank(s, win=365, minp=180):
-    """Trailing percentile of today's value among the last `win` days (0..1)."""
-    return s.rolling(win, min_periods=minp).apply(lambda a: (a[:-1] < a[-1]).mean(), raw=True)
+pct_rank = lab.pct_rank
 
 
 def atr_pct(n=14):
-    pc = C.shift(1)
-    tr = np.maximum(H - L, np.maximum((H - pc).abs(), (L - pc).abs()))
-    return tr.ewm(alpha=1 / n, adjust=False, min_periods=n).mean() / C
+    return lab.atr_pct(H, L, C, n)
 
 
 ATR = atr_pct()

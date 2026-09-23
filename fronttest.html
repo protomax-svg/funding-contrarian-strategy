@@ -35,6 +35,7 @@ th{color:var(--mute);font-weight:500;font-size:12px}
   <h1>Funding contrarian — paper fronttest</h1>
   <p class="sub" id="sub">loading…</p>
 
+  <div class="card" id="filt" style="margin-bottom:14px"></div>
   <div class="grid" id="kpis"></div>
 
   <div class="card"><svg id="chart" role="img" aria-label="Equity curve"></svg>
@@ -46,6 +47,7 @@ th{color:var(--mute);font-weight:500;font-size:12px}
   <div class="two">
     <div><h2>Last signal (top-30, lowest 7d funding first)</h2><div class="card scroll"><table id="sig"></table></div></div>
     <div>
+      <h2>Market filter history</h2><div class="card scroll"><table id="fhist"></table></div>
       <h2>Rebalances</h2><div class="card scroll"><table id="reb"></table></div>
       <h2>Funding payments</h2><div class="card scroll"><table id="fund"></table></div>
     </div>
@@ -106,6 +108,14 @@ async function refresh(){
              ["Long / Short", usd(lng,0) + " / " + usd(sht,0), ""]];
   $("kpis").innerHTML = k.map(([a,b,c]) => `<div class="card"><div class="k">${a}</div><div class="v ${c}">${b}</div></div>`).join("");
   chart(s.curve, s.start_equity);
+  const f = s.filter, pc = v => v == null ? "–" : Math.round(100*v) + "th pct";
+  $("filt").innerHTML = !f ? `<span class="k">Market filter: waiting for the first 00:05 UTC check</span>` :
+    `<b>Market filter (${f.day}):</b> ` +
+    `<span class="tag ${f.atr_on ? "pos" : "neg"}">${f.atr_on ? "TRADING" : "PAUSED — BTC too calm"}</span> ` +
+    `BTC ATR ${pc(f.btc_atr_pct)} (live rule: pause below 33rd) · ` +
+    `<span class="k">shadow trend rule: BTC vs 200d avg ${pc(f.btc_trend_pct)} → would ${f.trend_on_shadow ? "trade" : "pause"} (not applied)</span>`;
+  table($("fhist"), [["Day", r => r.day], ["BTC ATR", r => pc(r.btc_atr_pct)], ["ATR rule", r => r.atr_on ? `<span class="tag pos">ON</span>` : `<span class="tag neg">OFF</span>`],
+    ["Trend", r => pc(r.btc_trend_pct)], ["Trend (shadow)", r => r.trend_on_shadow ? "on" : "off"]], s.filter_history.slice(0,10));
   table($("pos"), [["Coin", r => r.sym.replace("USDT","")], ["Side", r => `<span class="tag ${r.qty>0?"pos":"neg"}">${r.side}</span>`],
     ["Notional", r => usd(r.notional,0)], ["Entry", r => px(r.entry)], ["Mark", r => px(r.mark)],
     ["Unreal. P&L", r => `<span class="${sgn(r.upnl)}">${usd(r.upnl)}</span>`],

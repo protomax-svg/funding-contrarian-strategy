@@ -34,6 +34,8 @@ START_EQUITY = 1_000.0
 COST_BPS = 7.0
 SNAP_S = 60                  # equity row in the DB every minute (prices themselves are live, every 3 s)
 LOOKBACK, TOP_N, Q = 7, 30, 0.2
+ATR_OFF_BELOW = 1 / 3        # LIVE: flat when BTC ATR% is in the low third of its last year (regime.py)
+TREND_OFF_ABOVE = 2 / 3      # SHADOW: logged only; BTC close/SMA200 in the top third of its last year
 API = "https://fapi.binance.com"
 WS_URL = "wss://fstream.binance.com/market/ws/!markPrice@arr"   # all perps, mark + next funding time, every 3 s
 # (the old /ws/ path still accepts the connection but sends nothing; hence the recv timeout below)
@@ -118,6 +120,17 @@ def build_panel(syms, now_ms):
     return P
 
 
+def market_filter(now_ms):
+    """BTC regime at the last closed day, same math as regime.py (lab.atr_pct / lab.pct_rank)."""
+    k = [r for r in get("/fapi/v1/klines", symbol="BTCUSDT", interval="1d", limit=1000) if r[6] < now_ms]
+    idx = pd.to_datetime([r[0] for r in k], unit="ms", utc=True)
+    h, l, c = (pd.Series([float(r[i]) for r in k], index=idx) for i in (2, 3, 4))
+    atr_p = lab.pct_rank(lab.atr_pct(h, l, c)).iloc[-1]
+    trend_p = lab.pct_rank(c / c.rolling(200).mean()).iloc[-1]
+    return {"day": str(idx[-1].date()), "btc_atr_pct": round(float(atr_p), 4), "btc_trend_pct": round(float(trend_p), 4),
+            "atr_on": bool(not atr_p < ATR_OFF_BELOW), "trend_on_shadow": bool(not trend_p >= TREND_OFF_ABOVE)}
+
+
 def compute_signal(now_ms):
     P = build_panel(tradable_symbols(), now_ms)
     U = lab.universe(P, top_n=TOP_N)
@@ -129,7 +142,9 @@ def compute_signal(now_ms):
         if U[s].iloc[-1]:
             rows.append({"sym": s, "f7_bps_day": round(1e4 * f7[s].iloc[-1], 3), "weight": round(float(w[s]), 4)})
     rows.sort(key=lambda r: r["f7_bps_day"])
-    return day, w[w != 0].to_dict(), rows
+    filt = market_filter(now_ms)
+    target = w[w != 0].to_dict() if filt["atr_on"] else {}          # ATR filter off -> go flat
+    return day, target, rows, filt
 
 
 # ---------------- storage ----------------
@@ -142,7 +157,9 @@ def db():
     create table if not exists equity(ts int, equity real, long_n real, short_n real);
     create table if not exists rebalances(ts int, day text, equity real, fees real, signal text);
     create table if not exists errors(ts int, msg text);
-    create table if not exists signals(day text, ts int, sym text, f7_bps_day real, weight real);""")
+    create table if not exists signals(day text, ts int, sym text, f7_bps_day real, weight real);
+    create table if not exists filters(day text, ts int, btc_atr_pct real, btc_trend_pct real,
+                                       atr_on int, trend_on_shadow int);""")
     return c
 
 
@@ -197,7 +214,7 @@ def settle_funding(st, syms=None):
 
 def rebalance():
     t = now_ms()
-    day, target_w, rows = compute_signal(t)
+    day, target_w, rows, filt = compute_signal(t)
     with lock:
         st = state()
         settle_funding(st)                       # old positions collect the 00:00 settlement first
@@ -226,6 +243,9 @@ def rebalance():
         save(st)
         set_kv("last_day", str(day.date()))
         set_kv("signal", rows)
+        set_kv("filter", filt)
+        CON.execute("insert into filters values(?,?,?,?,?,?)", (filt["day"], t, filt["btc_atr_pct"], filt["btc_trend_pct"],
+                                                                 int(filt["atr_on"]), int(filt["trend_on_shadow"])))
         CON.executemany("insert into signals values(?,?,?,?,?)",
                         [(str(day.date()), t, r["sym"], r["f7_bps_day"], r["weight"]) for r in rows])
         CON.execute("insert into rebalances values(?,?,?,?,?)", (t, str(day.date()), eq, fees, json.dumps(target_w)))
@@ -256,7 +276,9 @@ def loop():
             set_kv("last_day", last_closed_day())
         # everything needed to audit or move the run lives in the DB itself
         set_kv("rule", {"lookback_days": LOOKBACK, "top_n": TOP_N, "quantile": Q, "cost_bps": COST_BPS,
-                        "start_equity": START_EQUITY, "candidates": SYMBOLS})
+                        "start_equity": START_EQUITY, "candidates": SYMBOLS,
+                        "atr_filter_live": {"off_below_pct": ATR_OFF_BELOW, "window_days": 365, "atr_n": 14},
+                        "trend_filter_shadow": {"off_above_pct": TREND_OFF_ABOVE, "sma": 200, "window_days": 365}})
         if not CON.execute("select 1 from signals limit 1").fetchone() and kv("signal"):
             CON.executemany("insert into signals values(?,?,?,?,?)",      # backfill the pre-table rebalance
                             [(kv("last_day"), r[0], x["sym"], x["f7_bps_day"], x["weight"])
@@ -315,7 +337,7 @@ def api_state():
         nxt = datetime.now(timezone.utc).replace(hour=0, minute=5, second=0, microsecond=0) + timedelta(days=1)
         return {"now": now_ms(), "started": kv("started"), "start_equity": START_EQUITY, "equity": eq,
                 "cash": st["cash"], "fees_total": tot, "funding_total": fnd, "last_day": kv("last_day"),
-                "next_rebalance": int(nxt.timestamp() * 1000), "positions": pos, "signal": kv("signal", []),
+                "next_rebalance": int(nxt.timestamp() * 1000), "positions": pos, "signal": kv("signal", []), "filter": kv("filter"),
                 "curve": ser, "trades": q("select * from trades order by ts desc limit 200"),
                 "funding": q("select * from funding order by ts desc limit 200"),
                 "rebalances": q("select ts, day, equity, fees from rebalances order by ts desc limit 60"),
@@ -323,7 +345,8 @@ def api_state():
                 "feed": {"ws_age_s": round(time.time() - WS["ts"], 1) if WS["ts"] else None,
                          "ws_reconnects": WS["reconnects"], "rest_calls_1h": len(REST["calls"]),
                          "ip_weight_1m": REST["ip_weight_1m"]},
-                "rule": {"lookback_days": LOOKBACK, "top_n": TOP_N, "quantile": Q, "cost_bps": COST_BPS}}
+                "rule": {"lookback_days": LOOKBACK, "top_n": TOP_N, "quantile": Q, "cost_bps": COST_BPS},
+                "filter_history": q("select day, btc_atr_pct, btc_trend_pct, atr_on, trend_on_shadow from filters order by ts desc limit 60")}
 
 
 class H(BaseHTTPRequestHandler):
@@ -351,8 +374,9 @@ def selfcheck():
     DB = Path(tempfile.mkdtemp()) / "t.db"
     CON = db()
     px = {"A": 10.0, "B": 20.0, "C": 5.0}
+    FAKE_F = {"day": "x", "btc_atr_pct": 0.5, "btc_trend_pct": 0.5, "atr_on": True, "trend_on_shadow": True}
     mark_prices = lambda: dict(px)
-    compute_signal = lambda t: (pd.Timestamp("2026-01-01", tz="UTC"), {"A": 0.5, "B": -0.5}, [])
+    compute_signal = lambda t: (pd.Timestamp("2026-01-01", tz="UTC"), {"A": 0.5, "B": -0.5}, [], FAKE_F)
     get = lambda path, **k: []                        # no funding events
     rebalance()
     st = state()
@@ -362,12 +386,19 @@ def selfcheck():
     assert abs(st["pos"]["A"] * px["A"] - 0.5 * (START_EQUITY - 0)) < 1e-6
     px["A"], px["B"] = 11.0, 22.0                                            # both +10%: long/short cancel
     assert abs(equity_of(st, px) - equity_of(st, {"A": 10.0, "B": 20.0})) < 1e-6
-    compute_signal = lambda t: (pd.Timestamp("2026-01-02", tz="UTC"), {"C": 0.5, "B": -0.5}, [])
+    compute_signal = lambda t: (pd.Timestamp("2026-01-02", tz="UTC"), {"C": 0.5, "B": -0.5}, [], FAKE_F)
     before = equity_of(state(), px)
     rebalance()
     st = state()
     fee2 = CON.execute("select sum(fee) from trades").fetchone()[0] - fee1
     assert abs(equity_of(st, px) - (before - fee2)) < 1e-9 and "A" not in st["pos"]
+    # ATR filter off -> empty target -> everything closed, equity moves only by fees
+    compute_signal = lambda t: (pd.Timestamp("2026-01-03", tz="UTC"), {}, [], dict(FAKE_F, atr_on=False))
+    before = equity_of(state(), px); f0 = CON.execute("select sum(fee) from trades").fetchone()[0]
+    rebalance(); st = state()
+    assert not st["pos"] and abs(st["cash"] - (before - (CON.execute("select sum(fee) from trades").fetchone()[0] - f0))) < 1e-9
+    compute_signal = lambda t: (pd.Timestamp("2026-01-04", tz="UTC"), {"C": 0.5, "B": -0.5}, [], FAKE_F)
+    rebalance(); st = state()
     # a short receives positive funding
     get = lambda path, **k: [{"fundingTime": now_ms() - 1, "fundingRate": "0.001", "markPrice": "22"}] if k["symbol"] == "B" else []
     st = state(); st["fund_from"]["B"] = 0; c0 = st["cash"]; settle_funding(st)
