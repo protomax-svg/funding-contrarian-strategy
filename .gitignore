@@ -1,0 +1,8 @@
+# market data: re-download with fetch_data.py (~270 MB)
+data/
+# live fronttest state: move it with `python fronttest.py --backup out.db`, never commit it
+*.db
+*.db-journal
+*.log
+__pycache__/
+.venv/

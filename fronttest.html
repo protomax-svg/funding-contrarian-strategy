@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Funding Fronttest</title>
+<style>
+:root{--bg:#f7f7f5;--card:#fff;--ink:#1d1d1b;--mute:#6b6b66;--line:#e4e3de;--pos:#1a7f4b;--neg:#c0392b;--acc:#2b59c3}
+@media (prefers-color-scheme:dark){:root{--bg:#141413;--card:#1e1e1c;--ink:#ecebe6;--mute:#9a9992;--line:#33322e;--pos:#4cc38a;--neg:#ff6b5e;--acc:#7aa2ff}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.45 system-ui,-apple-system,Segoe UI,sans-serif}
+main{max-width:1180px;margin:0 auto;padding:20px 16px 48px}
+h1{font-size:20px;margin:0 0 2px}
+.sub{color:var(--mute);margin:0 0 18px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px;margin-bottom:14px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 14px}
+.k{color:var(--mute);font-size:12px}.v{font-size:20px;font-weight:600;font-variant-numeric:tabular-nums}
+.pos{color:var(--pos)}.neg{color:var(--neg)}
+h2{font-size:15px;margin:22px 0 8px}
+.two{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+@media (max-width:820px){.two{grid-template-columns:1fr}}
+.scroll{overflow-x:auto}
+table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}
+th,td{text-align:right;padding:6px 8px;border-bottom:1px solid var(--line);white-space:nowrap}
+th:first-child,td:first-child{text-align:left}
+th{color:var(--mute);font-weight:500;font-size:12px}
+.tag{font-size:11px;padding:1px 6px;border-radius:4px;border:1px solid currentColor}
+#chart{width:100%;height:220px;display:block}
+.err{color:var(--neg);font-size:12px}
+.note{color:var(--mute);font-size:12px;margin-top:6px}
+</style>
+</head>
+<body>
+<main>
+  <h1>Funding contrarian — paper fronttest</h1>
+  <p class="sub" id="sub">loading…</p>
+
+  <div class="grid" id="kpis"></div>
+
+  <div class="card"><svg id="chart" role="img" aria-label="Equity curve"></svg>
+    <div class="note">Equity marked every 5 min at Binance mark price. Start equity $10,000 (paper).</div></div>
+
+  <h2>Open positions</h2>
+  <div class="card scroll"><table id="pos"></table></div>
+
+  <div class="two">
+    <div><h2>Last signal (top-30, lowest 7d funding first)</h2><div class="card scroll"><table id="sig"></table></div></div>
+    <div>
+      <h2>Rebalances</h2><div class="card scroll"><table id="reb"></table></div>
+      <h2>Funding payments</h2><div class="card scroll"><table id="fund"></table></div>
+    </div>
+  </div>
+
+  <h2>Trades</h2>
+  <div class="card scroll"><table id="trades"></table></div>
+  <div id="errs"></div>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const usd = (x, d=2) => x == null ? "–" : (x < 0 ? "−$" : "$") + Math.abs(x).toLocaleString(undefined,{minimumFractionDigits:d,maximumFractionDigits:d});
+const sgn = x => x > 0 ? "pos" : x < 0 ? "neg" : "";
+const t = ms => new Date(ms).toISOString().replace("T"," ").slice(0,16) + " UTC";
+const px = x => x >= 100 ? x.toFixed(2) : x >= 1 ? x.toFixed(4) : x.toPrecision(5);
+
+function table(el, cols, rows){
+  el.innerHTML = "<tr>" + cols.map(c => `<th>${c[0]}</th>`).join("") + "</tr>" +
+    (rows.length ? rows.map(r => "<tr>" + cols.map(c => `<td>${c[1](r)}</td>`).join("") + "</tr>").join("")
+                 : `<tr><td colspan="${cols.length}" style="text-align:left;color:var(--mute)">nothing yet</td></tr>`);
+}
+
+function chart(curve, start){
+  const svg = $("chart"), W = svg.clientWidth || 800, H = 220, p = 36;
+  if (curve.length < 2){ svg.innerHTML = `<text x="12" y="24" fill="currentColor" opacity=".6">curve starts after the first snapshots</text>`; return; }
+  const xs = curve.map(c => c[0]), ys = curve.map(c => c[1]);
+  const x0 = xs[0], x1 = xs[xs.length-1], lo = Math.min(start, ...ys), hi = Math.max(start, ...ys), pad = (hi-lo)*0.1 || 1;
+  const X = v => p + (v-x0)/(x1-x0||1)*(W-p-8), Y = v => H-22 - (v-(lo-pad))/((hi+pad)-(lo-pad))*(H-34);
+  const d = curve.map((c,i) => (i?"L":"M") + X(c[0]).toFixed(1) + "," + Y(c[1]).toFixed(1)).join("");
+  const last = ys[ys.length-1], col = last >= start ? "var(--pos)" : "var(--neg)";
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  svg.innerHTML =
+    `<line x1="${p}" x2="${W-8}" y1="${Y(start)}" y2="${Y(start)}" stroke="var(--line)" stroke-dasharray="4 4"/>` +
+    `<text x="4" y="${Y(hi+pad)+10}" font-size="11" fill="var(--mute)">${usd(hi+pad,0)}</text>` +
+    `<text x="4" y="${Y(lo-pad)}" font-size="11" fill="var(--mute)">${usd(lo-pad,0)}</text>` +
+    `<text x="${p}" y="${H-4}" font-size="11" fill="var(--mute)">${t(x0)}</text>` +
+    `<text x="${W-8}" y="${H-4}" font-size="11" fill="var(--mute)" text-anchor="end">${t(x1)}</text>` +
+    `<path d="${d}" fill="none" stroke="${col}" stroke-width="2"/>`;
+}
+
+let S;
+async function refresh(){
+  let s;
+  try { s = await (await fetch("/api/state")).json(); } catch(e){ $("sub").textContent = "backend not reachable"; return; }
+  S = s;
+  const eq = s.equity, pnl = eq == null ? null : eq - s.start_equity;
+  const days = s.started ? (s.now - s.started)/864e5 : 0;
+  const lng = s.positions.filter(p => p.qty > 0).reduce((a,p) => a + p.notional, 0);
+  const sht = s.positions.filter(p => p.qty < 0).reduce((a,p) => a + p.notional, 0);
+  const mins = Math.max(0, Math.round((s.next_rebalance - s.now)/6e4));
+  $("sub").textContent = `Running ${days.toFixed(1)} days · signal day ${s.last_day ?? "–"} · next rebalance in ${Math.floor(mins/60)}h ${mins%60}m (00:05 UTC) · ` +
+    `rule: top-${s.rule.top_n}, ${s.rule.lookback_days}d funding, ${s.rule.quantile*100}% each side, ${s.rule.cost_bps} bps/side`;
+  const k = [["Equity", usd(eq), ""], ["P&L", usd(pnl), sgn(pnl)],
+             ["Return", pnl == null ? "–" : (100*pnl/s.start_equity).toFixed(2) + "%", sgn(pnl)],
+             ["Funding net", usd(s.funding_total), sgn(s.funding_total)], ["Fees paid", usd(-s.fees_total), "neg"],
+             ["Long / Short", usd(lng,0) + " / " + usd(sht,0), ""]];
+  $("kpis").innerHTML = k.map(([a,b,c]) => `<div class="card"><div class="k">${a}</div><div class="v ${c}">${b}</div></div>`).join("");
+  chart(s.curve, s.start_equity);
+  table($("pos"), [["Coin", r => r.sym.replace("USDT","")], ["Side", r => `<span class="tag ${r.qty>0?"pos":"neg"}">${r.side}</span>`],
+    ["Notional", r => usd(r.notional,0)], ["Entry", r => px(r.entry)], ["Mark", r => px(r.mark)],
+    ["Unreal. P&L", r => `<span class="${sgn(r.upnl)}">${usd(r.upnl)}</span>`],
+    ["Funding", r => `<span class="${sgn(r.funding)}">${usd(r.funding)}</span>`]], s.positions);
+  table($("sig"), [["Coin", r => r.sym.replace("USDT","")], ["7d funding (bps/day)", r => r.f7_bps_day.toFixed(2)],
+    ["Pick", r => r.weight > 0 ? `<span class="tag pos">LONG</span>` : r.weight < 0 ? `<span class="tag neg">SHORT</span>` : ""]], s.signal);
+  table($("reb"), [["Time", r => t(r.ts)], ["Signal day", r => r.day], ["Equity", r => usd(r.equity)], ["Fees", r => usd(r.fees)]], s.rebalances.slice(0,10));
+  table($("fund"), [["Time", r => t(r.ts)], ["Coin", r => r.sym.replace("USDT","")], ["Rate", r => (r.rate*100).toFixed(4)+"%"],
+    ["Payment", r => `<span class="${sgn(r.payment)}">${usd(r.payment)}</span>`]], s.funding.slice(0,15));
+  table($("trades"), [["Time", r => t(r.ts)], ["Coin", r => r.sym.replace("USDT","")],
+    ["Action", r => `<span class="tag ${r.qty>0?"pos":"neg"}">${r.qty>0?"BUY":"SELL"}</span>`],
+    ["Qty", r => Math.abs(r.qty).toPrecision(5)], ["Price", r => px(r.price)], ["Notional", r => usd(Math.abs(r.qty*r.price))], ["Fee", r => usd(r.fee)]], s.trades.slice(0,60));
+  $("errs").innerHTML = s.errors.length ? `<h2>Recent errors</h2>` + s.errors.slice(0,5).map(e => `<div class="err">${t(e.ts)} — ${e.msg}</div>`).join("") : "";
+}
+refresh(); setInterval(refresh, 30000); addEventListener("resize", () => S && chart(S.curve, S.start_equity));
+</script>
+</body>
+</html>

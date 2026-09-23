@@ -1,0 +1,19 @@
+# systemd unit for a server. Copy to /etc/systemd/system/, edit User and paths, then:
+#   sudo systemctl daemon-reload && sudo systemctl enable --now fronttest
+[Unit]
+Description=Funding-contrarian paper fronttest
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=trader
+WorkingDirectory=/opt/reddit-ideas
+Environment=FRONTTEST_DB=/opt/reddit-ideas/fronttest.db
+Environment=FRONTTEST_HOST=127.0.0.1
+Environment=FRONTTEST_PORT=8770
+ExecStart=/opt/reddit-ideas/.venv/bin/python fronttest.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
