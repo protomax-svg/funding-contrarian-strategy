@@ -9,3 +9,6 @@ __pycache__/
 # secrets
 .env
 jev_requests_used.txt
+# private infra doc (tailscale IP, server paths)
+RISK_INDEX_API_FOR_CLAUDE.md
+risk_*.json

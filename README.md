@@ -76,6 +76,13 @@ Jev's "profitable next week" probability had a **negative** rank correlation wit
 (−0.18, 90% CI −0.29 to −0.05); its exposure score had none (0.00). Its answers stayed near a coin flip (0.35-0.62)
 and correlated 0.58 with the simple ATR/trend rule. Not good enough to spend the 1,000-request budget.
 
+## BTC Risk Index (private API) as a filter (`risk_test.py` → `results_risk.md`)
+
+Tested 2022-07 → 2026-08: pause on zone 2 / zone ≥1 / index > 0.65-0.75, at the daily rebalance and intraday.
+None helped reliably. Zone-2 days were good in 2022-23 and bad in 2024-26 (the sign flips); pausing above 0.70 lowered
+Sharpe in both periods (−0.23 → −0.42 and 0.93 → 0.87). The strategy is market-neutral and earns *more* in wild markets,
+so a directional risk gauge removes good days. Not used. Needs the private API; its data and doc are git-ignored.
+
 ## Files
 
 | File | What |
