@@ -38,7 +38,7 @@ th{color:var(--mute);font-weight:500;font-size:12px}
   <div class="grid" id="kpis"></div>
 
   <div class="card"><svg id="chart" role="img" aria-label="Equity curve"></svg>
-    <div class="note">Equity marked every 5 min at Binance mark price. Start equity $10,000 (paper).</div></div>
+    <div class="note">Live P&amp;L refreshes every 5 s from the websocket mark price; equity is saved every minute. Start equity $10,000 (paper).</div></div>
 
   <h2>Open positions</h2>
   <div class="card scroll"><table id="pos"></table></div>
@@ -120,7 +120,7 @@ async function refresh(){
     ["Qty", r => Math.abs(r.qty).toPrecision(5)], ["Price", r => px(r.price)], ["Notional", r => usd(Math.abs(r.qty*r.price))], ["Fee", r => usd(r.fee)]], s.trades.slice(0,60));
   $("errs").innerHTML = s.errors.length ? `<h2>Recent errors</h2>` + s.errors.slice(0,5).map(e => `<div class="err">${t(e.ts)} — ${e.msg}</div>`).join("") : "";
 }
-refresh(); setInterval(refresh, 30000); addEventListener("resize", () => S && chart(S.curve, S.start_equity));
+refresh(); setInterval(refresh, 5000); addEventListener("resize", () => S && chart(S.curve, S.start_equity));
 </script>
 </body>
 </html>

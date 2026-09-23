@@ -32,6 +32,7 @@ HOST = os.environ.get("FRONTTEST_HOST", "127.0.0.1")    # 0.0.0.0 on a server be
 PORT = int(os.environ.get("FRONTTEST_PORT", 8770))
 START_EQUITY = 10_000.0
 COST_BPS = 7.0
+SNAP_S = 60                  # equity row in the DB every minute (prices themselves are live, every 3 s)
 LOOKBACK, TOP_N, Q = 7, 30, 0.2
 API = "https://fapi.binance.com"
 WS_URL = "wss://fstream.binance.com/market/ws/!markPrice@arr"   # all perps, mark + next funding time, every 3 s
@@ -251,6 +252,8 @@ def loop():
     with lock:
         if kv("started") is None:
             set_kv("started", now_ms())
+            # fresh DB: never trade mid-day on a stale signal; the first rebalance is the next 00:05 UTC
+            set_kv("last_day", last_closed_day())
         # everything needed to audit or move the run lives in the DB itself
         set_kv("rule", {"lookback_days": LOOKBACK, "top_n": TOP_N, "quantile": Q, "cost_bps": COST_BPS,
                         "start_equity": START_EQUITY, "candidates": SYMBOLS})
@@ -279,14 +282,14 @@ def loop():
                 for s in ready:           # keep retrying each loop until Binance has published the record
                     if s not in st["pos"] or st["fund_from"].get(s, 0) >= DUE[s] - 1000 or now_ms() - DUE[s] > 3_600_000:
                         DUE.pop(s, None)
-            if time.time() - last_snap >= 300:
+            if time.time() - last_snap >= SNAP_S:
                 snapshot()
                 last_snap = time.time()
         except Exception as e:
             with lock:
                 CON.execute("insert into errors values(?,?)", (now_ms(), f"{e!r}"[:500])); CON.commit()
             traceback.print_exc()
-        time.sleep(30)
+        time.sleep(5)
 
 
 # ---------------- API + UI ----------------

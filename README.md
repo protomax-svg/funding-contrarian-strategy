@@ -72,7 +72,7 @@ times for all perps, with 0 REST weight. REST is used only for (a) the daily sig
 `/fapi/v1/fundingRate` call per held coin right after each settlement (separate 500/5min limit), and (c) mark prices while the
 websocket is down. The UI header shows the feed state, our REST calls in the last hour, and the IP-wide weight Binance reports.
 Same rule, same code path as the backtest (`lab.universe` + `lab.xs_rank_weights`). It picks the same coins as the
-backtest on 2026-08-20 and 2026-08-30. Rebalances daily at 00:05 UTC. It charges 7 bps/side and applies every real funding
+backtest on 2026-08-20 and 2026-08-30. Rebalances daily at 00:05 UTC. A fresh DB waits for the next 00:05 UTC before its first trade. It charges 7 bps/side and applies every real funding
 settlement. State is kept in `fronttest.db` (SQLite), so a restart continues where it stopped.
 
 ```bash
@@ -92,7 +92,7 @@ Settings via env: `FRONTTEST_DB` (default `./fronttest.db`), `FRONTTEST_HOST` (d
 | `rebalances` | time, signal day, equity, fees, target weights |
 | `trades` | every paper fill: qty, price, fee |
 | `funding` | every funding settlement: rate, mark, payment |
-| `equity` | equity + long/short notional every 5 min |
+| `equity` | equity + long/short notional every minute |
 | `errors` | API or runtime errors |
 
 ### Move to a server
