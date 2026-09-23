@@ -8,3 +8,4 @@ __pycache__/
 .venv/
 # secrets
 .env
+jev_requests_used.txt

@@ -52,6 +52,30 @@ The same signal, but inside every group #longs == #shorts (sector labels, or pri
 Pairing cuts the drawdown a little and the edge about in half, and the edge no longer survives costs or delay.
 Part of the edge is *between* groups (whole sectors get crowded at once), which pairing removes. The fronttest stays on the base rule.
 
+## Regime study (`regime.py` → `results_regime.md`)
+
+States known at close t, trailing-365d percentiles, filter chosen on 2020-23, read on 2024-26.
+
+| Filter | OOS Sharpe | Max DD | Time in market |
+|---|---|---|---|
+| none (base) | 0.93 | −61% | 100% |
+| off when BTC ATR is in its low third | 1.07 | −38% | 62% |
+| off when BTC is far above its 200d average (top third) | 1.54 | −52% | 81% |
+| off when the strategy's own 60d return is in its low third | 1.16 | −43% | 75% |
+| vol target 15%/yr (30d) | 1.26 | −38% | avg 0.81x |
+| walk-forward choice among 25 filters | 1.07 | −47% | – |
+
+The strategy earns ~0 in calm markets (low ATR) and loses in euphoric BTC rallies (high-funding coins keep squeezing).
+Combinations reach OOS 1.7, but the pieces were chosen after seeing OOS consistency, so treat that as optimistic.
+Per-coin ATR sizing or excluding the most volatile coins changes little (OOS 0.98-0.99).
+
+## Jev model pilot (`jev_pilot.py` → `results_jev.txt`)
+
+190 random days from 2024-26, anonymised state (no dates or coin names), 200 requests.
+Jev's "profitable next week" probability had a **negative** rank correlation with the real next-7-day result
+(−0.18, 90% CI −0.29 to −0.05); its exposure score had none (0.00). Its answers stayed near a coin flip (0.35-0.62)
+and correlated 0.58 with the simple ATR/trend rule. Not good enough to spend the 1,000-request budget.
+
 ## Files
 
 | File | What |
@@ -63,6 +87,8 @@ Part of the edge is *between* groups (whole sectors get crowded at once), which 
 | `robust.py` → `results_robust.md` | Robustness battery + by-year table. |
 | `funding_deep.py` → `results_funding.md` | Deep-dive on the gem. |
 | `pairs_test.py` → `results_pairs.md` | Same signal with group-matched long/short pairs. |
+| `regime.py` → `results_regime.md` | Market-state filters, ATR, vol targeting, walk-forward. |
+| `jev_pilot.py` → `results_jev.txt`, `jev_pilot.jsonl` | Jev pilot (needs `JEV_API_KEY` in `.env`). |
 
 ## Setup
 

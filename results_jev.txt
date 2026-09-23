@@ -1,0 +1,15 @@
+n_days: 190
+IC p_profit vs next 7d: -0.175
+IC p_profit 90% CI: (np.float64(-0.289), np.float64(-0.054))
+IC exposure vs next 7d: -0.002
+IC exposure 90% CI: (np.float64(-0.12), np.float64(0.131))
+IC rule vs next 7d: -0.01
+IC rule 90% CI: (np.float64(-0.131), np.float64(0.106))
+next-7d return when Jev above its median (bps): 24.5
+next-7d return when Jev below its median (bps): 71.9
+next-7d return when rule ON (bps): 52.4
+next-7d return when rule OFF (bps): 36.7
+all days (bps): 45.2
+corr Jev p_profit vs rule: 0.58
+Jev p_profit spread (min / median / max): (0.35, 0.52, 0.62)
+avg input tokens: 628.0
