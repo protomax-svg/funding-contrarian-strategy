@@ -38,6 +38,20 @@ quarterly basis reversal (#9), staking yields (#8). Difficulty ribbon (#18): onl
 - 20% vol-targeting: Sharpe 1.19, OOS 1.29, DD −47%. Still a big drawdown.
 - Needed before any money: per-coin size cap, a stop on short-leg squeezes, and live paper trading.
 
+## Group-matched pairs (`pairs_test.py` → `results_pairs.md`)
+
+The same signal, but inside every group #longs == #shorts (sector labels, or price clusters refit every 30 days).
+
+| Variant | OOS Sharpe | at 15 bps | +1 day | Max DD |
+|---|---|---|---|---|
+| Base (fronttest) | **0.93** | **0.51** | **0.66** | −61% |
+| Sector pairs, N=5 | 0.47 | −0.02 | −0.20 | −48% |
+| Price-cluster pairs, N=5 | 0.47 | 0.05 | 0.43 | −44% |
+| Price-cluster pairs, N=6 | 0.29 | −0.15 | 0.19 | −34% |
+
+Pairing cuts the drawdown a little and the edge about in half, and the edge no longer survives costs or delay.
+Part of the edge is *between* groups (whole sectors get crowded at once), which pairing removes. The fronttest stays on the base rule.
+
 ## Files
 
 | File | What |
@@ -48,6 +62,7 @@ quarterly basis reversal (#9), staking yields (#8). Difficulty ribbon (#18): onl
 | `intraday.py` → `results_intraday.md` | #2, #13, #5, #6. |
 | `robust.py` → `results_robust.md` | Robustness battery + by-year table. |
 | `funding_deep.py` → `results_funding.md` | Deep-dive on the gem. |
+| `pairs_test.py` → `results_pairs.md` | Same signal with group-matched long/short pairs. |
 
 ## Setup
 
