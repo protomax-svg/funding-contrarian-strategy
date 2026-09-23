@@ -97,7 +97,9 @@ async function refresh(){
   const sht = s.positions.filter(p => p.qty < 0).reduce((a,p) => a + p.notional, 0);
   const mins = Math.max(0, Math.round((s.next_rebalance - s.now)/6e4));
   $("sub").textContent = `Running ${days.toFixed(1)} days · signal day ${s.last_day ?? "–"} · next rebalance in ${Math.floor(mins/60)}h ${mins%60}m (00:05 UTC) · ` +
-    `rule: top-${s.rule.top_n}, ${s.rule.lookback_days}d funding, ${s.rule.quantile*100}% each side, ${s.rule.cost_bps} bps/side`;
+    `rule: top-${s.rule.top_n}, ${s.rule.lookback_days}d funding, ${s.rule.quantile*100}% each side, ${s.rule.cost_bps} bps/side` +
+    ` · feed: websocket ${s.feed.ws_age_s == null ? "connecting" : s.feed.ws_age_s < 60 ? "live" : "STALE " + s.feed.ws_age_s + "s"}` +
+    `, our REST calls last hour ${s.feed.rest_calls_1h}, IP weight ${s.feed.ip_weight_1m ?? "–"}/2400`;
   const k = [["Equity", usd(eq), ""], ["P&L", usd(pnl), sgn(pnl)],
              ["Return", pnl == null ? "–" : (100*pnl/s.start_equity).toFixed(2) + "%", sgn(pnl)],
              ["Funding net", usd(s.funding_total), sgn(s.funding_total)], ["Fees paid", usd(-s.fees_total), "neg"],

@@ -67,6 +67,10 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 ## Fronttest (paper trading, live)
 
 `fronttest.py` (backend) + `fronttest.html` (UI) trade #7b on live Binance data with $10,000 of fake money.
+Data feed: one websocket (`wss://fstream.binance.com/market/ws/!markPrice@arr`) gives mark prices and funding
+times for all perps, with 0 REST weight. REST is used only for (a) the daily signal at 00:05 UTC (~80 weight), (b) one
+`/fapi/v1/fundingRate` call per held coin right after each settlement (separate 500/5min limit), and (c) mark prices while the
+websocket is down. The UI header shows the feed state, our REST calls in the last hour, and the IP-wide weight Binance reports.
 Same rule, same code path as the backtest (`lab.universe` + `lab.xs_rank_weights`). It picks the same coins as the
 backtest on 2026-08-20 and 2026-08-30. Rebalances daily at 00:05 UTC. It charges 7 bps/side and applies every real funding
 settlement. State is kept in `fronttest.db` (SQLite), so a restart continues where it stopped.
