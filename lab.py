@@ -50,8 +50,9 @@ def universe(P, top_n=30, min_age_bars=60, vol_window=30):
     c = P["close"]
     age = c.notna().cumsum()
     adv = P["qv"].rolling(vol_window, min_periods=vol_window // 2).mean()
-    rank = adv.where(age >= min_age_bars).rank(axis=1, ascending=False)
-    return (rank <= top_n) & c.notna()
+    alive = P["qv"] > 0                      # delisted coins keep printing flat zero-volume bars in the archive
+    rank = adv.where((age >= min_age_bars) & alive).rank(axis=1, ascending=False)
+    return (rank <= top_n) & c.notna() & alive
 
 
 def backtest(w, P, cost_bps=5.0, funding=True):

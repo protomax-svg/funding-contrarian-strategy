@@ -83,6 +83,24 @@ None helped reliably. Zone-2 days were good in 2022-23 and bad in 2024-26 (the s
 Sharpe in both periods (−0.23 → −0.42 and 0.93 → 0.87). The strategy is market-neutral and earns *more* in wild markets,
 so a directional risk gauge removes good days. Not used. Needs the private API; its data and doc are git-ignored.
 
+## All Binance crypto perps (`alltest.py` → `results_all.md`) — this is what the fronttest now runs
+
+676 USDT-M crypto perps incl. delisted (stocks/commodities/index perps excluded), point-in-time top-N by 30d volume,
+zero-volume (delisted) bars excluded. The hand-picked 50-coin list had hindsight bias: on the full list the
+"combination" and the ATR filter no longer beat the plain rule.
+
+| Top-N, plain rule | 2020-23 | 2024-26 | 2024-26 total | Max DD |
+|---|---|---|---|---|
+| 30 | 1.92 | 0.84 | +142% | −55% |
+| 50 | 1.88 | 0.71 | +79% | −35% |
+| **100 (live)** | **2.12** | **1.10** | **+123%** | **−27%** |
+
+Top-100 by year: 2020 +87%, 2021 +146%, 2022 +13%, 2023 +8%, 2024 +35%, 2025 +41%, 2026 (Jan-Aug) +18%.
+2024-26 split: price −21%/yr, funding received +63%/yr, costs −6%/yr. It is mostly a funding harvest on small
+high-funding coins (spread out: top-5 coins = 12% of the funding, 10 best days = 6%). Main risk: short squeezes on small caps.
+~41 positions on average, so with $1,000 each is ~$25 (fine for paper; check Binance minimum order sizes before real money).
+Live and backtest pick identical books on 2026-08-20 and 2026-08-30 (41/41).
+
 ## Files
 
 | File | What |
@@ -154,7 +172,7 @@ scp fronttest-copy.db server:/opt/reddit-ideas/fronttest.db
 
 It continues from the same state. Funding paid while it was stopped is booked on the next start.
 The UI has no login, so keep `FRONTTEST_HOST=127.0.0.1` on a server and reach it with `ssh -L 8770:127.0.0.1:8770 server`.
-**Market filter.** Live: flat when BTC's 14d ATR% is in the low third of its last 365 days (`regime.py`: OOS Sharpe 0.93 → 1.07,
+**Market filter (now shadow only, since the full-universe test).** Was live: flat when BTC's 14d ATR% is in the low third of its last 365 days (`regime.py`: OOS Sharpe 0.93 → 1.07,
 max DD −61% → −38%, 31 separate off-episodes). Shadow (logged, not applied): BTC close/SMA200 in the top third of its last year;
 its backtest benefit comes almost entirely from one episode (the Oct 2023 – Apr 2024 ETF rally), so it has to earn its place live.
 Both values are in the `filters` table and match the backtest values exactly on 2025-03-10, 2026-08-20 and 2026-08-30.

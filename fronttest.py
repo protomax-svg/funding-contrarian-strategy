@@ -1,9 +1,10 @@
 """Paper-trading fronttest of the funding-contrarian strategy (#7b), exactly as backtested.
 
-Rule (unchanged from robust.py): daily at the UTC close, among the top-30 perps by 30d volume
-(same candidate list as the backtest), long the 20% with the lowest 7-day funding, short the
-20% with the highest; half the equity long, half short, equal weight. 7 bps/side on every
-change; real funding paid/received at every settlement.
+Rule (alltest.py "top-100 base"): daily at the UTC close, among ALL Binance USDT-M crypto perps
+(underlyingType COIN, status TRADING), take the top-100 by 30d average quote volume (>= 60 days listed);
+long the 20% with the lowest 7-day funding, short the 20% with the highest; half the equity long, half short,
+equal weight. A coin that leaves the top-100 is closed at the next rebalance. 7 bps/side on every change;
+real funding paid/received at every settlement. BTC ATR and trend filters are logged in shadow mode only.
 
 Signal logic is lab.universe + lab.xs_rank_weights on a live-built panel, so it cannot drift
 from the backtest. Run:  python fronttest.py   -> http://127.0.0.1:8770   (env: FRONTTEST_DB, FRONTTEST_HOST, FRONTTEST_PORT)
@@ -14,6 +15,7 @@ import sqlite3
 import threading
 import time
 import traceback
+import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -24,7 +26,6 @@ import pandas as pd
 from websockets.sync.client import connect as ws_connect
 
 import lab
-from fetch_data import SYMBOLS
 
 HERE = Path(__file__).resolve().parent
 DB = Path(os.environ.get("FRONTTEST_DB", HERE / "fronttest.db"))
@@ -33,8 +34,8 @@ PORT = int(os.environ.get("FRONTTEST_PORT", 8770))
 START_EQUITY = 1_000.0
 COST_BPS = 7.0
 SNAP_S = 60                  # equity row in the DB every minute (prices themselves are live, every 3 s)
-LOOKBACK, TOP_N, Q = 7, 30, 0.2
-ATR_OFF_BELOW = 1 / 3        # LIVE: flat when BTC ATR% is in the low third of its last year (regime.py)
+LOOKBACK, TOP_N, Q = 7, 100, 0.2
+ATR_OFF_BELOW = 1 / 3        # SHADOW: BTC ATR% in the low third of its last year (hurt on the full universe, alltest.py)
 TREND_OFF_ABOVE = 2 / 3      # SHADOW: logged only; BTC close/SMA200 in the top third of its last year
 API = "https://fapi.binance.com"
 WS_URL = "wss://fstream.binance.com/market/ws/!markPrice@arr"   # all perps, mark + next funding time, every 3 s
@@ -48,7 +49,7 @@ REST = {"calls": [], "ip_weight_1m": None}   # our REST call times + last IP-wid
 
 # ---------------- binance (keyless public REST) ----------------
 def get(path, **params):
-    q = "&".join(f"{k}={v}" for k, v in params.items())
+    q = urllib.parse.urlencode(params)          # some symbols are non-ASCII (e.g. Chinese names)
     for i in range(4):
         try:
             with urllib.request.urlopen(f"{API}{path}?{q}", timeout=20) as r:
@@ -62,9 +63,11 @@ def get(path, **params):
 
 
 def tradable_symbols():
+    """Every live USDT-M crypto perp (stocks, commodities, pre-market and index perps excluded)."""
     info = get("/fapi/v1/exchangeInfo")
-    live = {s["symbol"] for s in info["symbols"] if s["status"] == "TRADING" and s["contractType"] == "PERPETUAL"}
-    return [s for s in SYMBOLS if s in live]
+    return sorted(s["symbol"] for s in info["symbols"]
+                  if s["status"] == "TRADING" and s["contractType"] == "PERPETUAL"
+                  and s["quoteAsset"] == "USDT" and s.get("underlyingType") == "COIN")
 
 
 def mark_prices():
@@ -100,22 +103,29 @@ def ws_loop():
 
 
 def build_panel(syms, now_ms):
+    """Daily closes + volume for every candidate (limit 99 -> weight 1 each, ~650 weight once a day),
+    then funding only for the coins that made the top-N (fundingRate has its own 500/5min limit)."""
     close, qv, fund = {}, {}, {}
     start = now_ms - 12 * 86_400_000
     for s in syms:
-        k = get("/fapi/v1/klines", symbol=s, interval="1d", limit=130)
+        k = get("/fapi/v1/klines", symbol=s, interval="1d", limit=99, endTime=now_ms - 1)
         k = [r for r in k if r[6] < now_ms]                        # closed bars only
+        if not k:
+            continue
         idx = pd.to_datetime([r[0] for r in k], unit="ms", utc=True)
         close[s] = pd.Series([float(r[4]) for r in k], index=idx)
         qv[s] = pd.Series([float(r[7]) for r in k], index=idx)
-        f = get("/fapi/v1/fundingRate", symbol=s, startTime=start, limit=1000)
+        time.sleep(0.05)                                           # spread the weight: ~2-3 min per day
+    P = {"close": pd.DataFrame(close).sort_index(), "qv": pd.DataFrame(qv).sort_index()}
+    U = lab.universe(P, top_n=TOP_N)
+    for s in [c for c in P["close"].columns if U[c].iloc[-1]]:
+        f = get("/fapi/v1/fundingRate", symbol=s, startTime=start, endTime=now_ms - 1, limit=1000)
         fs = pd.Series([float(r["fundingRate"]) for r in f],
                        index=pd.to_datetime([r["fundingTime"] for r in f], unit="ms", utc=True))
         fs = fs[fs.index < pd.Timestamp(now_ms, unit="ms", tz="UTC")]
         # same bucketing as lab.load: an event at 00:00:00.004 belongs to the day that just closed
         fs.index = fs.index.floor("min") - pd.Timedelta("1min")
         fund[s] = fs.resample("1D").sum() if len(fs) else pd.Series(dtype=float)
-    P = {"close": pd.DataFrame(close).sort_index(), "qv": pd.DataFrame(qv).sort_index()}
     P["funding"] = pd.DataFrame(fund).reindex(index=P["close"].index, columns=P["close"].columns).fillna(0.0)
     return P
 
@@ -142,9 +152,8 @@ def compute_signal(now_ms):
         if U[s].iloc[-1]:
             rows.append({"sym": s, "f7_bps_day": round(1e4 * f7[s].iloc[-1], 3), "weight": round(float(w[s]), 4)})
     rows.sort(key=lambda r: r["f7_bps_day"])
-    filt = market_filter(now_ms)
-    target = w[w != 0].to_dict() if filt["atr_on"] else {}          # ATR filter off -> go flat
-    return day, target, rows, filt
+    filt = market_filter(now_ms)                                    # shadow only: logged, never gates trades
+    return day, w[w != 0].to_dict(), rows, filt
 
 
 # ---------------- storage ----------------
@@ -189,8 +198,12 @@ def now_ms():
     return int(time.time() * 1000)
 
 
+def px_of(st, px, s):
+    return px.get(s) or PX.get(s) or st["entry"].get(s, 0.0)     # delisted coin: last known price
+
+
 def equity_of(st, px):
-    return st["cash"] + sum(q * px[s] for s, q in st["pos"].items())
+    return st["cash"] + sum(q * px_of(st, px, s) for s, q in st["pos"].items())
 
 
 # ---------------- engine ----------------
@@ -223,6 +236,8 @@ def rebalance():
         fees = 0.0
         for s in sorted(set(st["pos"]) | set(target_w)):
             q_old = st["pos"].get(s, 0.0)
+            if s not in px:                        # delisted/removed while held: close at the last known price
+                px[s] = PX.get(s, st["entry"].get(s, 1.0))
             q_new = target_w.get(s, 0.0) * eq / px[s]
             d = q_new - q_old
             if abs(d * px[s]) < 1e-6:
@@ -258,8 +273,8 @@ def snapshot(px=None):
     with lock:
         st = state()
         px = px or mark_prices()
-        ln = sum(q * px[s] for s, q in st["pos"].items() if q > 0)
-        sn = sum(q * px[s] for s, q in st["pos"].items() if q < 0)
+        ln = sum(q * px_of(st, px, s) for s, q in st["pos"].items() if q > 0)
+        sn = sum(q * px_of(st, px, s) for s, q in st["pos"].items() if q < 0)
         CON.execute("insert into equity values(?,?,?,?)", (now_ms(), equity_of(st, px), ln, sn))
         CON.commit()
 
@@ -276,8 +291,8 @@ def loop():
             set_kv("last_day", last_closed_day())
         # everything needed to audit or move the run lives in the DB itself
         set_kv("rule", {"lookback_days": LOOKBACK, "top_n": TOP_N, "quantile": Q, "cost_bps": COST_BPS,
-                        "start_equity": START_EQUITY, "candidates": SYMBOLS,
-                        "atr_filter_live": {"off_below_pct": ATR_OFF_BELOW, "window_days": 365, "atr_n": 14},
+                        "start_equity": START_EQUITY, "candidates": "all USDT-M perps with underlyingType COIN",
+                        "atr_filter_shadow": {"off_below_pct": ATR_OFF_BELOW, "window_days": 365, "atr_n": 14},
                         "trend_filter_shadow": {"off_above_pct": TREND_OFF_ABOVE, "sma": 200, "window_days": 365}})
         if not CON.execute("select 1 from signals limit 1").fetchone() and kv("signal"):
             CON.executemany("insert into signals values(?,?,?,?,?)",      # backfill the pre-table rebalance
