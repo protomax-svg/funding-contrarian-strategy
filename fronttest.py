@@ -26,6 +26,7 @@ import pandas as pd
 from websockets.sync.client import connect as ws_connect
 
 import lab
+import stats
 
 HERE = Path(__file__).resolve().parent
 DB = Path(os.environ.get("FRONTTEST_DB", HERE / "fronttest.db"))
@@ -34,6 +35,7 @@ PORT = int(os.environ.get("FRONTTEST_PORT", 8770))
 START_EQUITY = 1_000.0
 COST_BPS = 7.0
 SNAP_S = 60                  # equity row in the DB every minute (prices themselves are live, every 3 s)
+MARK_S = 900                 # mark of every held coin every 15 min -> worst/best move per trade (stats page)
 LOOKBACK, TOP_N, Q = 7, 100, 0.2
 ATR_OFF_BELOW = 1 / 3        # SHADOW: BTC ATR% in the low third of its last year (hurt on the full universe, alltest.py)
 TREND_OFF_ABOVE = 2 / 3      # SHADOW: logged only; BTC close/SMA200 in the top third of its last year
@@ -43,6 +45,7 @@ WS_URL = "wss://fstream.binance.com/market/ws/!markPrice@arr"   # all perps, mar
 lock = threading.RLock()
 # live cache fed by the websocket (plain dict writes are atomic under the GIL)
 PX, NEXT_T, DUE = {}, {}, {}            # mark price; next funding time; symbol -> settlement time just passed
+IDX, RATE = {}, {}                      # spot index price; predicted funding rate of the running interval
 WS = {"ts": 0.0, "reconnects": 0, "sweep": True}
 REST = {"calls": [], "ip_weight_1m": None}   # our REST call times + last IP-wide weight Binance reported
 
@@ -82,6 +85,10 @@ def on_mark(items):
     for d in items:
         sym, t_next = d["s"], int(d["T"])
         PX[sym] = float(d["p"])
+        if d.get("i"):
+            IDX[sym] = float(d["i"])
+        if d.get("r") not in (None, ""):
+            RATE[sym] = float(d["r"])
         prev = NEXT_T.get(sym)
         if prev and t_next > prev:
             DUE[sym] = prev
@@ -105,7 +112,7 @@ def ws_loop():
 def build_panel(syms, now_ms):
     """Daily closes + volume for every candidate (limit 99 -> weight 1 each, ~650 weight once a day),
     then funding only for the coins that made the top-N (fundingRate has its own 500/5min limit)."""
-    close, qv, fund = {}, {}, {}
+    close, qv, fund, high, low = {}, {}, {}, {}, {}
     start = now_ms - 12 * 86_400_000
     for s in syms:
         k = get("/fapi/v1/klines", symbol=s, interval="1d", limit=99, endTime=now_ms - 1)
@@ -115,8 +122,11 @@ def build_panel(syms, now_ms):
         idx = pd.to_datetime([r[0] for r in k], unit="ms", utc=True)
         close[s] = pd.Series([float(r[4]) for r in k], index=idx)
         qv[s] = pd.Series([float(r[7]) for r in k], index=idx)
+        high[s] = pd.Series([float(r[2]) for r in k], index=idx)
+        low[s] = pd.Series([float(r[3]) for r in k], index=idx)
         time.sleep(0.05)                                           # spread the weight: ~2-3 min per day
-    P = {"close": pd.DataFrame(close).sort_index(), "qv": pd.DataFrame(qv).sort_index()}
+    P = {"close": pd.DataFrame(close).sort_index(), "qv": pd.DataFrame(qv).sort_index(),
+         "high": pd.DataFrame(high).sort_index(), "low": pd.DataFrame(low).sort_index()}
     U = lab.universe(P, top_n=TOP_N)
     for s in [c for c in P["close"].columns if U[c].iloc[-1]]:
         f = get("/fapi/v1/fundingRate", symbol=s, startTime=start, endTime=now_ms - 1, limit=1000)
@@ -147,10 +157,21 @@ def compute_signal(now_ms):
     f7 = P["funding"].rolling(LOOKBACK).mean()
     w = lab.xs_rank_weights(-f7, U, q=Q).iloc[-1]
     day = P["close"].index[-1]
+    # market state of every top-N coin at this close, for the stats page (all from the klines already fetched)
+    C = P["close"]
+    atr = lab.atr_pct(P["high"], P["low"], C).iloc[-1]
+    vol30 = C.pct_change(fill_method=None).rolling(30, min_periods=15).std().iloc[-1] * np.sqrt(365)
+    adv = P["qv"].rolling(30, min_periods=15).mean().iloc[-1]
+    rank = adv.where(U.iloc[-1]).rank(ascending=False)
+    r1, r7 = C.iloc[-1] / C.iloc[-2] - 1, C.iloc[-1] / C.iloc[-8] - 1
+    fin = lambda v, k=1.0, n=4: None if not np.isfinite(v) else round(float(v) * k, n)
     rows = []
     for s in P["close"].columns:
         if U[s].iloc[-1]:
-            rows.append({"sym": s, "f7_bps_day": round(1e4 * f7[s].iloc[-1], 3), "weight": round(float(w[s]), 4)})
+            rows.append({"sym": s, "f7_bps_day": round(1e4 * f7[s].iloc[-1], 3), "weight": round(float(w[s]), 4),
+                         "rank_vol": fin(rank[s], 1, 0), "adv30_musd": fin(adv[s], 1e-6, 2), "close": fin(C[s].iloc[-1], 1, 10),
+                         "atr14_pct": fin(atr[s], 100, 3), "vol30_pct": fin(vol30[s], 100, 2),
+                         "ret1d_pct": fin(r1[s], 100, 3), "ret7d_pct": fin(r7[s], 100, 3)})
     rows.sort(key=lambda r: r["f7_bps_day"])
     filt = market_filter(now_ms)                                    # shadow only: logged, never gates trades
     return day, w[w != 0].to_dict(), rows, filt
@@ -168,7 +189,12 @@ def db():
     create table if not exists errors(ts int, msg text);
     create table if not exists signals(day text, ts int, sym text, f7_bps_day real, weight real);
     create table if not exists filters(day text, ts int, btc_atr_pct real, btc_trend_pct real,
-                                       atr_on int, trend_on_shadow int);""")
+                                       atr_on int, trend_on_shadow int);
+    create table if not exists features(day text, ts int, sym text, rank_vol real, adv30_musd real, close real,
+                                        atr14_pct real, vol30_pct real, ret1d_pct real, ret7d_pct real, f7_bps real,
+                                        weight real, mark real, pred_funding_bps real, basis_bps real);
+    create table if not exists marks(ts int, sym text, mark real);
+    create index if not exists marks_sym_ts on marks(sym, ts);""")
     return c
 
 
@@ -264,6 +290,12 @@ def rebalance():
         CON.executemany("insert into signals values(?,?,?,?,?)",
                         [(str(day.date()), t, r["sym"], r["f7_bps_day"], r["weight"]) for r in rows])
         CON.execute("insert into rebalances values(?,?,?,?,?)", (t, str(day.date()), eq, fees, json.dumps(target_w)))
+        # market state at the moment of the trades: mark, predicted funding, basis vs spot index (websocket, 0 weight)
+        basis = lambda s: (1e4 * (PX[s] / IDX[s] - 1)) if s in PX and IDX.get(s) else None
+        CON.executemany("insert into features values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        [(str(day.date()), t, r["sym"], r["rank_vol"], r["adv30_musd"], r["close"], r["atr14_pct"],
+                          r["vol30_pct"], r["ret1d_pct"], r["ret7d_pct"], r["f7_bps_day"], r["weight"], PX.get(r["sym"]),
+                          1e4 * RATE[r["sym"]] if r["sym"] in RATE else None, basis(r["sym"])) for r in rows])
         CON.commit()
         snapshot(px)
     print(f"[{datetime.now(timezone.utc):%F %T}] rebalanced for {day.date()}: equity {eq:.2f}, fees {fees:.2f}", flush=True)
@@ -299,7 +331,7 @@ def loop():
                             [(kv("last_day"), r[0], x["sym"], x["f7_bps_day"], x["weight"])
                              for r in CON.execute("select ts from rebalances order by ts desc limit 1") for x in kv("signal")])
         CON.commit()
-    last_snap = 0
+    last_snap = last_mark = 0
     while True:
         try:
             utc = datetime.now(timezone.utc)
@@ -322,6 +354,12 @@ def loop():
             if time.time() - last_snap >= SNAP_S:
                 snapshot()
                 last_snap = time.time()
+            if time.time() - last_mark >= MARK_S and WS["ts"]:
+                with lock:
+                    held = list(state()["pos"])
+                    CON.executemany("insert into marks values(?,?,?)", [(now_ms(), s, PX[s]) for s in held if s in PX])
+                    CON.commit()
+                last_mark = time.time()
         except Exception as e:
             with lock:
                 CON.execute("insert into errors values(?,?)", (now_ms(), f"{e!r}"[:500])); CON.commit()
@@ -330,6 +368,28 @@ def loop():
 
 
 # ---------------- API + UI ----------------
+STATS_CACHE = {"t": 0.0, "out": None}
+
+
+def api_stats():
+    """Read-only connection and no trading lock during the heavy part; cached 60 s for many tabs."""
+    if STATS_CACHE["out"] is not None and time.time() - STATS_CACHE["t"] < 60:
+        return STATS_CACHE["out"]
+    with lock:
+        st = state()
+        px = dict(PX) if PX else {}
+        eq = equity_of(st, px) if px else None
+        started = kv("started")
+    ro = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+    try:
+        out = stats.compute(ro, px, START_EQUITY, eq)
+    finally:
+        ro.close()
+    out.update({"now": now_ms(), "started": started, "start_equity": START_EQUITY, "equity": eq})
+    STATS_CACHE.update(t=time.time(), out=out)
+    return out
+
+
 def api_state():
     with lock:
         st = state()
@@ -368,6 +428,10 @@ class H(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path.startswith("/api/state"):
             body, ctype = json.dumps(api_state()).encode(), "application/json"
+        elif self.path.startswith("/api/stats"):
+            body, ctype = json.dumps(api_stats(), default=float).encode(), "application/json"
+        elif self.path in ("/stats", "/stats.html"):
+            body, ctype = (HERE / "stats.html").read_bytes(), "text/html; charset=utf-8"
         elif self.path in ("/", "/index.html"):
             body, ctype = (HERE / "fronttest.html").read_bytes(), "text/html; charset=utf-8"
         else:

@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fronttest Statistics</title>
+<style>
+:root{--bg:#f7f7f5;--card:#fff;--ink:#1d1d1b;--mute:#6b6b66;--line:#e4e3de;--pos:#1a7f4b;--neg:#c0392b;--acc:#2b59c3;--hi:#f1f0ea}
+@media (prefers-color-scheme:dark){:root{--bg:#141413;--card:#1e1e1c;--ink:#ecebe6;--mute:#9a9992;--line:#33322e;--pos:#4cc38a;--neg:#ff6b5e;--acc:#7aa2ff;--hi:#262623}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.45 system-ui,-apple-system,Segoe UI,sans-serif}
+main{max-width:1280px;margin:0 auto;padding:20px 16px 48px}
+nav{margin-bottom:10px}nav a{color:var(--acc);text-decoration:none;margin-right:14px}
+h1{font-size:20px;margin:0 0 2px}h2{font-size:15px;margin:24px 0 8px}
+.sub{color:var(--mute);margin:0 0 16px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 14px}
+.k{color:var(--mute);font-size:12px}.v{font-size:19px;font-weight:600;font-variant-numeric:tabular-nums}
+.pos{color:var(--pos)}.neg{color:var(--neg)}
+.scroll{overflow-x:auto}
+table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}
+th,td{text-align:right;padding:5px 7px;border-bottom:1px solid var(--line);white-space:nowrap}
+th:first-child,td:first-child{text-align:left}
+th{color:var(--mute);font-weight:500;font-size:12px;cursor:pointer;user-select:none}
+th.sorted::after{content:" ▾"}th.sorted.asc::after{content:" ▴"}
+tr.coin{cursor:pointer}tr.coin:hover td{background:var(--hi)}
+tr.detail td{background:var(--hi);padding:8px}
+.tag{font-size:11px;padding:1px 6px;border-radius:4px;border:1px solid currentColor}
+input{background:var(--card);color:var(--ink);border:1px solid var(--line);border-radius:6px;padding:6px 8px;font:inherit;width:220px}
+#bars{width:100%;height:180px;display:block}
+.note{color:var(--mute);font-size:12px;margin-top:6px}
+.two{display:grid;grid-template-columns:1fr 1fr;gap:14px}@media (max-width:860px){.two{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<main>
+  <nav><a href="/">← Live dashboard</a><a href="/stats">Statistics</a></nav>
+  <h1>Fronttest statistics</h1>
+  <p class="sub" id="sub">loading…</p>
+
+  <div class="grid" id="kpis"></div>
+
+  <h2>Live vs backtest (same rule, top-100, 2024–26, 1x)</h2>
+  <div class="card scroll"><table id="bt"></table>
+    <div class="note">Live numbers need months before they mean anything: one normal day moves about ±1.4%.</div></div>
+
+  <div class="two">
+    <div><h2>Long vs short</h2><div class="card scroll"><table id="sides"></table></div></div>
+    <div><h2>Where the P&amp;L comes from</h2><div class="card scroll"><table id="parts"></table></div></div>
+  </div>
+
+  <h2>Daily P&amp;L</h2>
+  <div class="card"><svg id="bars" role="img" aria-label="Daily P&L bars"></svg>
+    <div class="scroll"><table id="daily"></table></div></div>
+
+  <h2>Every coin ever traded <input id="q" placeholder="filter coin…" style="margin-left:10px"></h2>
+  <div class="card scroll"><table id="coins"></table>
+    <div class="note">Click a coin to see each of its trades. Price P&amp;L includes the open part. MAE = worst move against the trade while held (15-min marks), MFE = best move for it. Entry values = market state at the rebalance that opened the trade.</div></div>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const fin = x => x !== null && x !== undefined && isFinite(x);
+const usd = (x, d=2) => !fin(x) ? "–" : (x < 0 ? "−$" : "$") + Math.abs(x).toLocaleString(undefined,{minimumFractionDigits:d,maximumFractionDigits:d});
+const pct = (x, d=2) => !fin(x) ? "–" : x.toFixed(d) + "%";
+const num = (x, d=2) => !fin(x) ? "–" : x.toFixed(d);
+const sgn = x => !fin(x) ? "" : x > 0 ? "pos" : x < 0 ? "neg" : "";
+const col = (v, f) => `<span class="${sgn(v)}">${f(v)}</span>`;
+const t = ms => ms ? new Date(ms).toISOString().replace("T"," ").slice(0,16) : "open";
+const nm = s => s.replace(/USDT$/, "");
+
+function table(el, cols, rows, sortable){
+  const head = "<tr>" + cols.map((c,i) => `<th data-i="${i}">${c[0]}</th>`).join("") + "</tr>";
+  el.innerHTML = head + (rows.length ? rows.map(r => "<tr>" + cols.map(c => `<td>${c[1](r)}</td>`).join("") + "</tr>").join("")
+    : `<tr><td colspan="${cols.length}" style="text-align:left;color:var(--mute)">nothing yet</td></tr>`);
+}
+
+let S, sortKey = "net", sortAsc = false, open = new Set();
+const COIN_COLS = [
+  ["Coin", r => `<b>${nm(r.sym)}</b>`, "sym"],
+  ["Now", r => r.open_now ? `<span class="tag ${r.open_now==="LONG"?"pos":"neg"}">${r.open_now}</span>` : "", "open_now"],
+  ["Trades", r => r.trades, "trades"], ["Longs", r => r.longs, "longs"], ["Shorts", r => r.shorts, "shorts"],
+  ["Days held", r => num(r.days_held,1), "days_held"],
+  ["Net", r => col(r.net, usd), "net"], ["Price", r => col(r.price_pnl, usd), "price_pnl"],
+  ["Funding", r => col(r.funding, usd), "funding"], ["Fees", r => usd(-r.fees), "fees"],
+  ["Win rate", r => fin(r.win_rate) ? Math.round(100*r.win_rate)+"%" : "–", "win_rate"],
+  ["Avg hold h", r => num(r.avg_hold_h,0), "avg_hold_h"],
+  ["Best", r => col(r.best, usd), "best"], ["Worst", r => col(r.worst, usd), "worst"],
+  ["Worst MAE", r => col(r.worst_mae_pct, pct), "worst_mae_pct"], ["Best MFE", r => col(r.best_mfe_pct, pct), "best_mfe_pct"],
+  ["Fund. events", r => r.funding_events, "funding_events"],
+  ["Avg rate bps", r => num(r.avg_funding_rate_bps,2), "avg_funding_rate_bps"],
+  ["Entry 7d fund. bps/d", r => num(r.avg_entry_f7_bps,2), "avg_entry_f7_bps"],
+  ["Entry ATR14", r => pct(r.avg_entry_atr14_pct), "avg_entry_atr14_pct"],
+  ["Entry vol30 (yr)", r => pct(r.avg_entry_vol30_pct,0), "avg_entry_vol30_pct"],
+  ["Entry vol rank", r => num(r.avg_entry_rank,0), "avg_entry_rank"],
+];
+const EP_COLS = [
+  ["Side", r => `<span class="tag ${r.side==="LONG"?"pos":"neg"}">${r.side}</span>`], ["Opened", r => t(r.open_ts)], ["Closed", r => t(r.close_ts)],
+  ["Hold h", r => num(r.hold_h,0)], ["Entry", r => num(r.entry,6)], ["Exit / mark", r => num(r.exit,6)], ["Max size", r => usd(r.max_notional)],
+  ["Resizes", r => r.resizes], ["Net", r => col(r.net, usd)], ["Return", r => col(r.return_pct, pct)],
+  ["Price", r => col(r.price_pnl + (r.unrealized||0), usd)], ["Funding", r => col(r.funding, usd)], ["Fees", r => usd(-r.fees)],
+  ["MAE", r => col(r.mae_pct, pct)], ["MFE", r => col(r.mfe_pct, pct)],
+  ["Entry 7d fund.", r => num(r.entry_f7_bps,2)], ["Entry pred. fund.", r => num(r.entry_pred_funding_bps,2)],
+  ["Entry basis bps", r => num(r.entry_basis_bps,1)], ["Entry ATR14", r => pct(r.entry_atr14_pct)],
+  ["Entry vol30", r => pct(r.entry_vol30_pct,0)], ["Entry 1d / 7d", r => pct(r.entry_ret1d_pct,1) + " / " + pct(r.entry_ret7d_pct,1)],
+  ["Entry rank", r => num(r.entry_rank_vol,0)], ["Entry vol $M/d", r => num(r.entry_adv30_musd,1)],
+];
+
+function renderCoins(){
+  const q = $("q").value.trim().toUpperCase();
+  let rows = S.coins.filter(r => !q || r.sym.includes(q));
+  rows.sort((a,b) => { const x = a[sortKey], y = b[sortKey];
+    const c = (x === null || x === undefined) - (y === null || y === undefined) || (x > y ? 1 : x < y ? -1 : 0);
+    return sortAsc ? c : -c; });
+  const eps = {}; S.episodes.forEach(e => (eps[e.sym] ||= []).push(e));
+  let html = "<tr>" + COIN_COLS.map(c => `<th data-k="${c[2]}" class="${c[2]===sortKey?"sorted"+(sortAsc?" asc":""):""}">${c[0]}</th>`).join("") + "</tr>";
+  for (const r of rows){
+    html += `<tr class="coin" data-s="${r.sym}">` + COIN_COLS.map(c => `<td>${c[1](r)}</td>`).join("") + "</tr>";
+    if (open.has(r.sym)){
+      const inner = document.createElement("table"); table(inner, EP_COLS, eps[r.sym] || []);
+      html += `<tr class="detail"><td colspan="${COIN_COLS.length}"><div class="scroll">${inner.outerHTML}</div></td></tr>`;
+    }
+  }
+  $("coins").innerHTML = rows.length ? html : html + `<tr><td colspan="${COIN_COLS.length}" style="text-align:left;color:var(--mute)">nothing yet</td></tr>`;
+}
+$("coins").addEventListener("click", e => {
+  const th = e.target.closest("th"); if (th){ const k = th.dataset.k; sortAsc = k === sortKey ? !sortAsc : false; sortKey = k; renderCoins(); return; }
+  const tr = e.target.closest("tr.coin"); if (tr){ const s = tr.dataset.s; open.has(s) ? open.delete(s) : open.add(s); renderCoins(); }
+});
+$("q").addEventListener("input", renderCoins);
+
+function bars(daily){
+  const svg = $("bars"), W = svg.clientWidth || 900, H = 180, p = 30, n = daily.length;
+  if (!n){ svg.innerHTML = `<text x="10" y="24" fill="currentColor" opacity=".6">no full day yet</text>`; return; }
+  const m = Math.max(...daily.map(d => Math.abs(d.pnl)), 1e-9), bw = Math.max(2, (W - p - 8) / n - 2), y0 = H / 2;
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  svg.innerHTML = `<line x1="${p}" x2="${W-8}" y1="${y0}" y2="${y0}" stroke="var(--line)"/>` +
+    `<text x="2" y="12" font-size="11" fill="var(--mute)">${usd(m,0)}</text><text x="2" y="${H-4}" font-size="11" fill="var(--mute)">${usd(-m,0)}</text>` +
+    daily.map((d,i) => { const h = Math.abs(d.pnl) / m * (H/2 - 10), x = p + i * (bw + 2);
+      return `<rect x="${x}" y="${d.pnl >= 0 ? y0 - h : y0}" width="${bw}" height="${Math.max(h,1)}" fill="${d.pnl >= 0 ? "var(--pos)" : "var(--neg)"}"><title>${d.day}: ${usd(d.pnl)}</title></rect>`; }).join("");
+}
+
+async function refresh(){
+  try { S = await (await fetch("/api/stats")).json(); } catch(e){ $("sub").textContent = "backend not reachable"; return; }
+  const T = S.totals, D = S.daily_summary || {}, B = S.backtest;
+  $("sub").textContent = `Started ${t(S.started)} UTC · ${S.coins.length} coins traded · ${S.episodes.length} round trips · refreshes every 60 s`;
+  const k = [["Equity", usd(S.equity), ""], ["Net P&L", usd(T.net), sgn(T.net)], ["Price P&L", usd(T.price_pnl), sgn(T.price_pnl)],
+    ["Funding", usd(T.funding), sgn(T.funding)], ["Fees", usd(-T.fees), "neg"], ["Days", D.days ?? "–", ""],
+    ["Max DD (minute data)", pct(D.max_dd_intraday_pct), "neg"], ["Win days", pct(D.win_days_pct,0), ""],
+    ["Check: unexplained", usd(T.unattributed), Math.abs(T.unattributed || 0) > 0.05 ? "neg" : ""]];
+  $("kpis").innerHTML = k.map(([a,b,c]) => `<div class="card"><div class="k">${a}</div><div class="v ${c}">${b}</div></div>`).join("");
+  const ann = x => fin(x) ? x * 365 : null;
+  table($("bt"), [["Metric", r => r[0]], ["Live", r => r[1]], ["Backtest", r => r[2]]], [
+    ["Sharpe (annual)", num(D.sharpe), num(B.sharpe)],
+    ["Average day", pct(D.daily_mean_pct,3), pct(B.daily_mean_pct,3)],
+    ["Day-to-day swing (std)", pct(D.daily_std_pct), pct(B.daily_std_pct)],
+    ["Worst day", pct(D.worst_day_pct), pct(B.worst_day_pct)],
+    ["Max drawdown (daily)", pct(D.max_dd_pct), pct(B.max_dd_pct)],
+    ["Price P&L per year (% of start)", pct(D.days ? 100 * T.price_pnl / S.start_equity * 365 / D.days : null,1), pct(B.price_pct_yr,1)],
+    ["Funding per year (% of start)", pct(D.days ? 100 * T.funding / S.start_equity * 365 / D.days : null,1), pct(B.funding_pct_yr,1)],
+    ["Fees per year (% of start)", pct(D.days ? 100 * T.fees / S.start_equity * 365 / D.days : null,1), pct(B.cost_pct_yr,1)]]);
+  table($("sides"), [["Side", r => r.side], ["Trades", r => r.trades], ["Open", r => r.open], ["Net", r => col(r.net, usd)],
+    ["Price", r => col(r.price_pnl, usd)], ["Funding", r => col(r.funding, usd)], ["Fees", r => usd(-r.fees)],
+    ["Win rate", r => fin(r.win_rate) ? Math.round(100*r.win_rate)+"%" : "–"], ["Avg hold h", r => num(r.avg_hold_h,0)],
+    ["Avg MAE", r => pct(r.avg_mae_pct)], ["Worst MAE", r => col(r.worst_mae_pct, pct)]], S.sides);
+  table($("parts"), [["Part", r => r[0]], ["Amount", r => r[1]]], [
+    ["Price (closed + open)", col(T.price_pnl, usd)], ["Funding", col(T.funding, usd)], ["Fees", usd(-T.fees)],
+    ["= Net", col(T.net, usd)], ["Equity change", col(T.equity_change, usd)],
+    ["Unexplained (should be ~0)", usd(T.unattributed)], ["Funding outside any trade (should be 0)", usd(T.funding_not_in_a_trade)]]);
+  bars(S.daily);
+  table($("daily"), [["Day (UTC)", r => r.day], ["Equity", r => usd(r.equity)], ["P&L", r => col(r.pnl, usd)], ["Return", r => col(r.ret_pct, pct)],
+    ["Price", r => col(r.price_pnl, usd)], ["Funding", r => col(r.funding, usd)], ["Fees", r => usd(-r.fees)]], [...S.daily].reverse().slice(0, 60));
+  renderCoins();
+}
+refresh(); setInterval(refresh, 60000); addEventListener("resize", () => S && bars(S.daily));
+</script>
+</body>
+</html>
