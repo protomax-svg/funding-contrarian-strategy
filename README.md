@@ -149,6 +149,10 @@ setsid nohup .venv/bin/python fronttest.py > fronttest.log 2>&1 < /dev/null &
 
 Settings via env: `FRONTTEST_DB` (default `./fronttest.db`), `FRONTTEST_HOST` (default `127.0.0.1`), `FRONTTEST_PORT` (default `8770`).
 
+**Statistics page:** `http://127.0.0.1:8770/stats` — every coin ever traded (longs/shorts, days held, price vs funding vs fees,
+win rate, worst/best move while held, market state at entry), every round trip, long vs short, daily P&L, live vs backtest,
+and a check that price + funding − fees equals the equity change. Logic in `stats.py` (`python stats.py` = self-check).
+
 ### What the DB holds (`fronttest.db`, SQLite)
 
 | Table | Content |
@@ -160,6 +164,8 @@ Settings via env: `FRONTTEST_DB` (default `./fronttest.db`), `FRONTTEST_HOST` (d
 | `funding` | every funding settlement: rate, mark, payment |
 | `equity` | equity + long/short notional every minute |
 | `errors` | API or runtime errors |
+| `features` | market state of every top-100 coin at each rebalance: volume rank, 30d volume, ATR14, 30d vol, 1d/7d return, 7d funding, predicted funding, basis vs spot |
+| `marks` | mark price of every held coin every 15 min (worst/best move per trade) |
 
 ### Move to a server
 
