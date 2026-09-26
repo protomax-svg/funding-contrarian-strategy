@@ -42,6 +42,9 @@ th{color:var(--mute);font-weight:500;font-size:12px}
   <div class="card"><svg id="chart" role="img" aria-label="Equity curve"></svg>
     <div class="note">Live P&amp;L refreshes every 5 s from the websocket mark price; equity is saved every minute. Start equity $1,000 (paper).</div></div>
 
+  <h2>Working orders (executor)</h2>
+  <div class="card scroll"><table id="working"></table></div>
+
   <h2>Open positions</h2>
   <div class="card scroll"><table id="pos"></table></div>
 
@@ -121,6 +124,9 @@ async function refresh(){
     ["Notional", r => usd(r.notional,0)], ["Entry", r => px(r.entry)], ["Mark", r => px(r.mark)],
     ["Unreal. P&L", r => `<span class="${sgn(r.upnl)}">${usd(r.upnl)}</span>`],
     ["Funding", r => `<span class="${sgn(r.funding)}">${usd(r.funding)}</span>`]], s.positions);
+  table($("working"), [["Coin", r => r.sym.replace("USDT","")], ["Kind", r => r.kind], ["Side", r => r.qty > 0 ? "BUY" : "SELL"],
+    ["Status", r => r.status], ["Limit", r => r.limit_px ? px(r.limit_px) : "–"], ["Moves", r => r.moves ?? 0],
+    ["Age", r => Math.round((s.now - r.created) / 60000) + " min"], ["Spread at start", r => (r.spread0_bps ?? 0).toFixed(1) + " bps"]], s.working || []);
   table($("sig"), [["Coin", r => r.sym.replace("USDT","")], ["7d funding (bps/day)", r => r.f7_bps_day.toFixed(2)],
     ["Pick", r => r.weight > 0 ? `<span class="tag pos">LONG</span>` : r.weight < 0 ? `<span class="tag neg">SHORT</span>` : ""]], s.signal);
   table($("reb"), [["Time", r => t(r.ts)], ["Signal day", r => r.day], ["Equity", r => usd(r.equity)], ["Fees", r => usd(r.fees)]], s.rebalances.slice(0,10));

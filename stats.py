@@ -75,7 +75,7 @@ def episodes(con, marks_now=None):
         return E
     E["unrealized"] = E.get("unrealized", 0.0)
     E["unrealized"] = E["unrealized"].fillna(0.0)
-    end = E.close_ts.fillna(now)
+    end = pd.to_numeric(E.close_ts, errors="coerce").fillna(now)
     # funding inside [open, close): the close happens right after the 00:00 settlement it still collects
     # per coin: sorted arrays + binary search -> each round trip is O(log n), not a scan
     def arrays(df, cols):
@@ -190,9 +190,40 @@ def daily(con, start_equity):
     return d.reset_index(names="day"), summary
 
 
+def execution(con):
+    """Order-level stats from the executor (empty before it existed)."""
+    if not _has(con, "orders"):
+        return {}, []
+    o = _df(con, "select * from orders")
+    if o.empty:
+        return {}, []
+    done = o[o.status.isin(["filled_maker", "filled_taker"])].copy()
+    done["secs"] = (done.fill_ts - done.created) / 1000
+    done["notional"] = (done.qty.abs() * done.fill_px)
+    # what a market order at the start would have cost vs what we paid: + = saved
+    done["half_spread_bps"] = done.spread0_bps / 2
+    done["vs_mid_bps"] = 1e4 * (done.fill_px / done.mid0 - 1) * done.qty.apply(lambda q: 1 if q > 0 else -1)
+    mk, tk = done[done.status == "filled_maker"], done[done.status == "filled_taker"]
+    q = lambda s, p: float(s.quantile(p)) if len(s) else None
+    summ = {"orders": len(o), "maker_fills": len(mk), "taker_fills": len(tk), "skipped": int((o.status == "skipped").sum()),
+            "working": int((~o.status.isin(["filled_maker", "filled_taker", "skipped"])).sum()),
+            "maker_share_pct": 100 * len(mk) / len(done) if len(done) else None,
+            "fill_secs_median": q(done.secs, .5), "fill_secs_p90": q(done.secs, .9),
+            "maker_fill_secs_median": q(mk.secs, .5), "moves_avg": float(done.moves.mean()) if len(done) else None,
+            "moves_max": int(done.moves.max()) if len(done) else None,
+            "cost_vs_mid_bps_avg": float((done.vs_mid_bps * done.notional).sum() / done.notional.sum()) if len(done) else None,
+            "taker_would_cost_bps_avg": float((done.half_spread_bps * done.notional).sum() / done.notional.sum()) if len(done) else None,
+            "fees_paid": float(done.fee.sum()),
+            "fees_if_all_taker": float((done.notional * 5e-4).sum()),
+            "taker_reasons": tk.reason.value_counts().to_dict() if len(tk) else {}}
+    o["secs"] = (o.fill_ts - o.created) / 1000
+    return summ, o.sort_values("created", ascending=False)
+
+
 def compute(con, marks_now, start_equity, equity_now):
     E = episodes(con, marks_now)
     D, dsum = daily(con, start_equity)
+    ex_sum, ex_orders = execution(con)
     parts = {"price_pnl": float(E.price_pnl.sum() + E.unrealized.sum()) if len(E) else 0.0,
              "funding": float(E.funding.sum()) if len(E) else 0.0, "fees": float(E.fees.sum()) if len(E) else 0.0}
     parts["net"] = parts["price_pnl"] + parts["funding"] - parts["fees"]
@@ -207,7 +238,8 @@ def compute(con, marks_now, start_equity, equity_now):
         [{k: (None if isinstance(v, float) and not math.isfinite(v) else v) for k, v in r.items()} for r in df.to_dict("records")]
     return {"totals": parts, "daily_summary": dsum, "backtest": BACKTEST,
             "sides": clean(per_side(E)) if len(E) else [], "coins": clean(per_coin(E)) if len(E) else [],
-            "episodes": clean(E.sort_values("open_ts", ascending=False)) if len(E) else [], "daily": clean(D)}
+            "episodes": clean(E.sort_values("open_ts", ascending=False)) if len(E) else [], "daily": clean(D),
+            "execution": ex_sum, "orders": clean(ex_orders.head(500)) if len(ex_orders) else []}
 
 
 if __name__ == "__main__":

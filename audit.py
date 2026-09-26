@@ -151,15 +151,24 @@ def main(db):
                 f"{'OK' if 0 < lag_h < 24 else 'BAD'} | 5 RULE {len(sig)} coins, {len(L)} long / {len(S)} short, "
                 f"long f7 <= short f7: {rule_ok}, equal size: {len(sizes) <= 2}, net {sum(r[2] for r in L + S):+.4f}")
         ok &= 0 < lag_h < 24 and rule_ok and neutral
-        # positions right after this rebalance must be exactly the signal: same coins, same side
+        # positions once this rebalance's orders are done (= just before the next rebalance, or now) must equal the
+        # signal, minus entries the executor skipped (wide spread, too little funding); still-working orders are pending
+        nxt = next((r[0] for r in reb if r[0] > ts), None)
+        horizon = nxt if nxt else int(time.time() * 1000) + 1
         held = defaultdict(float)
         for tts, s_, q_, _, _ in trades:
-            if tts <= ts:
+            if tts < horizon:
                 held[s_] += q_
-        want = {r[0]: (1 if r[2] > 0 else -1) for r in L + S}
+        has_orders = con.execute("select 1 from sqlite_master where name='orders'").fetchone()
+        ords = con.execute("select sym, status from orders where reb_ts=?", (ts,)).fetchall() if has_orders else []
+        skipped = {o[0] for o in ords if o[1] == "skipped"}
+        pending = {o[0] for o in ords if o[1] not in ("filled_maker", "filled_taker", "skipped")}
+        want = {r[0]: (1 if r[2] > 0 else -1) for r in L + S if r[0] not in skipped}
         have = {k: (1 if v > 0 else -1) for k, v in held.items() if abs(v) > 1e-12}
-        pos_ok = want == have
-        line += f" | positions match signal: {pos_ok}" + ("" if pos_ok else f" (diff {sorted(set(want.items()) ^ set(have.items()))[:4]})")
+        diff = {x for x in set(want.items()) ^ set(have.items()) if x[0] not in pending}
+        pos_ok = not diff
+        line += (f" | positions match signal: {pos_ok}" + (f" (skipped {len(skipped)})" if skipped else "")
+                 + (f" (still working {len(pending)})" if pending else "") + ("" if pos_ok else f" (diff {sorted(diff)[:4]})"))
         ok &= pos_ok
         # re-derive 7d funding + the daily close for a few coins from raw Binance data
         if has_feat and sig:
@@ -179,6 +188,14 @@ def main(db):
             line += " | re-derived close + 7d funding: " + ("OK" if not errs else "; ".join(errs))
             ok &= not errs
         print(line)
+    # ---------------- 6 execution ----------------
+    if con.execute("select 1 from sqlite_master where name='orders'").fetchone():
+        o = con.execute("select status, count(*) from orders group by status").fetchall()
+        mk = con.execute("select o.fill_px, t.price from orders o join trades t on t.sym=o.sym and t.ts=o.fill_ts "
+                         "where o.status like 'filled_%'").fetchall()
+        bad = [x for x in mk if abs(x[0] - x[1]) > 1e-12]
+        print(f"6 EXEC    orders by status {dict(o)} | order fill price == trade price: {not bad}")
+        ok &= not bad
     print("\nRESULT:", "ALL CHECKS PASS" if ok else "SOMETHING IS WRONG - see lines above")
     return ok
 

@@ -25,6 +25,7 @@ import numpy as np
 import pandas as pd
 from websockets.sync.client import connect as ws_connect
 
+import executor
 import lab
 import stats
 
@@ -199,7 +200,11 @@ def db():
                                         atr14_pct real, vol30_pct real, ret1d_pct real, ret7d_pct real, f7_bps real,
                                         weight real, mark real, pred_funding_bps real, basis_bps real);
     create table if not exists marks(ts int, sym text, mark real);
-    create index if not exists marks_sym_ts on marks(sym, ts);""")
+    create index if not exists marks_sym_ts on marks(sym, ts);
+    create table if not exists orders(id integer primary key autoincrement, reb_ts int, sym text, qty real, kind text,
+                                      f7_bps real, created int, status text, limit_px real, moves int, placed int,
+                                      spread0_bps real, mid0 real, est_funding_bps real, fill_px real, fill_ts int,
+                                      fee real, reason text, mark0 real);""")
     if "mark" not in [r[1] for r in c.execute("pragma table_info(trades)")]:
         c.execute("alter table trades add column mark real")     # older DBs: fills before this change were at mark
     return c
@@ -258,11 +263,72 @@ def settle_funding(st, syms=None):
             st["fund_from"][s] = t
 
 
-def rebalance():
+def apply_fill(st, s, d, fill, fee, t, mark):
+    """Book one fill of d units at `fill` into the state and the trade log (caller holds the lock)."""
+    q_old = st["pos"].get(s, 0.0)
+    q_new = q_old + d
+    st["cash"] -= d * fill + fee
+    CON.execute("insert into trades(ts, sym, qty, price, fee, mark) values(?,?,?,?,?,?)", (t, s, d, fill, fee, mark))
+    if abs(q_new * fill) < 1e-6:
+        for m in ("pos", "entry", "fund_from", "opened"):
+            st[m].pop(s, None)
+        return
+    if q_old == 0 or np.sign(q_old) != np.sign(q_new):
+        st["entry"][s] = fill; st["fund_from"][s] = t; st["opened"][s] = t   # funding starts at the fill
+    elif abs(q_new) > abs(q_old):                                              # added on the same side: average in
+        st["entry"][s] = (st["entry"][s] * abs(q_old) + fill * abs(d)) / abs(q_new)
+    st["pos"][s] = q_new
+
+
+SESSION = {"s": None}
+ORDER_COLS = ("status", "limit_px", "moves", "placed", "spread0_bps", "mid0", "est_funding_bps", "fill_px", "fill_ts", "fee", "reason")
+
+
+def _order_row(o):
+    ms = lambda x: int(x * 1000) if x else None
+    return (o.status, o.limit, o.moves, ms(o.placed), o.spread0_bps, o.mid0, o.est_funding_bps, o.fill_px, ms(o.fill_ts), o.fee, o.reason)
+
+
+def on_order_update(o):
+    with lock:
+        CON.execute(f"update orders set {', '.join(c + '=?' for c in ORDER_COLS)} where id=?", (*_order_row(o), o.id))
+        CON.commit()
+
+
+def on_order_fill(o):
+    with lock:
+        st = state()
+        apply_fill(st, o.sym, o.qty, o.fill_px, o.fee, int(o.fill_ts * 1000), PX.get(o.sym))
+        save(st)
+        CON.execute(f"update orders set {', '.join(c + '=?' for c in ORDER_COLS)} where id=?", (*_order_row(o), o.id))
+        CON.commit()
+
+
+def start_session(orders, book):
+    SESSION["s"] = executor.Session(orders, on_order_fill, on_order_update, book)
+    SESSION["s"].start()
+
+
+def resume_orders():
+    """After a restart: continue every order that was not finished."""
+    rows = CON.execute("select id, sym, qty, kind, created, f7_bps, status, limit_px, moves, placed from orders "
+                       "where status not in ('filled_maker','filled_taker','skipped')").fetchall()
+    if not rows:
+        return
+    orders = [executor.Order(id=i, sym=sy, qty=q, kind=k, created=c / 1000, f7_bps=f, status=stt, limit=lp, moves=mv or 0,
+                             placed=(pl / 1000 if pl else None)) for i, sy, q, k, c, f, stt, lp, mv, pl in rows]
+    book = book_prices()
+    start_session(orders, {o.sym: book[o.sym] for o in orders if o.sym in book})
+    print(f"resumed {len(orders)} unfinished orders", flush=True)
+
+
+def rebalance(sync=False):
+    """Build the orders for today's target book. sync=True fills everything at once at bid/ask (self-check);
+    otherwise the executor works post-only maker orders with repricing and a taker fallback."""
     t = now_ms()
     day, target_w, rows, filt = compute_signal(t)     # uses only data from before t
     with lock:
-        t = now_ms()                                   # fills happen now (the download above takes minutes)
+        t = now_ms()                                   # orders start now (the download above takes minutes)
         st = state()
         settle_funding(st)                       # old positions collect the 00:00 settlement first
         px = mark_prices()
@@ -271,7 +337,8 @@ def rebalance():
         except Exception:
             book = {}                              # no book -> fill at mark (logged as a fill with zero spread)
         eq = equity_of(st, px)
-        fees = 0.0
+        f7 = {r["sym"]: r["f7_bps_day"] for r in rows}
+        orders, fees = [], 0.0
         for s in sorted(set(st["pos"]) | set(target_w)):
             q_old = st["pos"].get(s, 0.0)
             if s not in px:                        # delisted/removed while held: close at the last known price
@@ -280,21 +347,17 @@ def rebalance():
             d = q_new - q_old
             if abs(d * px[s]) < 1e-6:
                 continue
-            bid, ask = book.get(s, (0.0, 0.0))
-            fill = (ask if d > 0 else bid) if bid > 0 and ask > 0 else px[s]    # cross the real spread
-            fee = abs(d) * fill * FEE_BPS / 1e4
-            st["cash"] -= d * fill + fee
-            fees += fee
-            CON.execute("insert into trades(ts, sym, qty, price, fee, mark) values(?,?,?,?,?,?)", (t, s, d, fill, fee, px[s]))
-            if abs(q_new) * px[s] < 1e-6:
-                for m in ("pos", "entry", "fund_from", "opened"):
-                    st[m].pop(s, None)
+            kind = "entry" if q_old == 0 else "exit" if q_new == 0 else "flip" if np.sign(q_old) != np.sign(q_new) else "resize"
+            if sync or s not in book:
+                bid, ask = book.get(s, (0.0, 0.0))
+                fill = (ask if d > 0 else bid) if bid > 0 and ask > 0 else px[s]    # cross the real spread
+                fee = abs(d) * fill * FEE_BPS / 1e4
+                fees += fee
+                apply_fill(st, s, d, fill, fee, t, px[s])
                 continue
-            if q_old == 0 or np.sign(q_old) != np.sign(q_new):
-                st["entry"][s] = fill; st["fund_from"][s] = t; st["opened"][s] = t
-            elif abs(q_new) > abs(q_old):        # added on the same side: average in
-                st["entry"][s] = (st["entry"][s] * abs(q_old) + fill * abs(d)) / abs(q_new)
-            st["pos"][s] = q_new
+            cur = CON.execute("insert into orders(reb_ts, sym, qty, kind, f7_bps, created, status, mark0) values(?,?,?,?,?,?,?,?)",
+                              (t, s, d, kind, f7.get(s), t, "new", px[s]))
+            orders.append(executor.Order(id=cur.lastrowid, sym=s, qty=d, kind=kind, created=t / 1000, f7_bps=f7.get(s)))
         save(st)
         set_kv("last_day", str(day.date()))
         set_kv("signal", rows)
@@ -304,7 +367,7 @@ def rebalance():
         CON.executemany("insert into signals values(?,?,?,?,?)",
                         [(str(day.date()), t, r["sym"], r["f7_bps_day"], r["weight"]) for r in rows])
         CON.execute("insert into rebalances values(?,?,?,?,?)", (t, str(day.date()), eq, fees, json.dumps(target_w)))
-        # market state at the moment of the trades: mark, predicted funding, basis vs spot index (websocket, 0 weight)
+        # market state at the moment of the orders: mark, predicted funding, basis vs spot index (websocket, 0 weight)
         basis = lambda s: (1e4 * (PX[s] / IDX[s] - 1)) if s in PX and IDX.get(s) else None
         CON.executemany("insert into features values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                         [(str(day.date()), t, r["sym"], r["rank_vol"], r["adv30_musd"], r["close"], r["atr14_pct"],
@@ -312,7 +375,10 @@ def rebalance():
                           1e4 * RATE[r["sym"]] if r["sym"] in RATE else None, basis(r["sym"])) for r in rows])
         CON.commit()
         snapshot(px)
-    print(f"[{datetime.now(timezone.utc):%F %T}] rebalanced for {day.date()}: equity {eq:.2f}, fees {fees:.2f}", flush=True)
+    if orders:
+        start_session(orders, {o.sym: book[o.sym] for o in orders})
+    print(f"[{datetime.now(timezone.utc):%F %T}] rebalanced for {day.date()}: equity {eq:.2f}, "
+          f"{len(orders)} orders to the executor, immediate fees {fees:.2f}", flush=True)
 
 
 def snapshot(px=None):
@@ -345,6 +411,10 @@ def loop():
                             [(kv("last_day"), r[0], x["sym"], x["f7_bps_day"], x["weight"])
                              for r in CON.execute("select ts from rebalances order by ts desc limit 1") for x in kv("signal")])
         CON.commit()
+    try:
+        resume_orders()
+    except Exception as e:
+        print(f"resume failed: {e!r}", flush=True)
     last_snap = last_mark = 0
     while True:
         try:
@@ -352,7 +422,8 @@ def loop():
             # daily bar closes 00:00 UTC; wait 5 min so klines + the 00:00 funding print are final
             with lock:
                 due = kv("last_day") != last_closed_day()
-            if due and (utc.hour > 0 or utc.minute >= 5):
+            busy = SESSION["s"] is not None and SESSION["s"].is_alive()
+            if due and not busy and (utc.hour > 0 or utc.minute >= 5):
                 rebalance()
             # funding: one REST call per held symbol, only right after the websocket saw it settle
             ready = {s for s, t in list(DUE.items()) if now_ms() - t > 60_000}
@@ -435,7 +506,9 @@ def api_state():
                          "ws_reconnects": WS["reconnects"], "rest_calls_1h": len(REST["calls"]),
                          "ip_weight_1m": REST["ip_weight_1m"]},
                 "rule": {"lookback_days": LOOKBACK, "top_n": TOP_N, "quantile": Q, "fee_bps": FEE_BPS},
-                "filter_history": q("select day, btc_atr_pct, btc_trend_pct, atr_on, trend_on_shadow from filters order by ts desc limit 60")}
+                "filter_history": q("select day, btc_atr_pct, btc_trend_pct, atr_on, trend_on_shadow from filters order by ts desc limit 60"),
+                "working": q("select sym, qty, kind, status, limit_px, moves, created, spread0_bps from orders "
+                             "where status not in ('filled_maker','filled_taker','skipped') order by created")}
 
 
 class H(BaseHTTPRequestHandler):
@@ -473,7 +546,7 @@ def selfcheck():
     book_prices = lambda: {}                           # no book -> fills at mark, so the fee math below is exact
     compute_signal = lambda t: (pd.Timestamp("2026-01-01", tz="UTC"), {"A": 0.5, "B": -0.5}, [], FAKE_F)
     get = lambda path, **k: []                        # no funding events
-    rebalance()
+    rebalance(sync=True)
     st = state()
     fee1 = CON.execute("select sum(fee) from trades").fetchone()[0]
     assert abs(equity_of(st, px) - (START_EQUITY - fee1)) < 1e-9
@@ -483,17 +556,17 @@ def selfcheck():
     assert abs(equity_of(st, px) - equity_of(st, {"A": 10.0, "B": 20.0})) < 1e-6
     compute_signal = lambda t: (pd.Timestamp("2026-01-02", tz="UTC"), {"C": 0.5, "B": -0.5}, [], FAKE_F)
     before = equity_of(state(), px)
-    rebalance()
+    rebalance(sync=True)
     st = state()
     fee2 = CON.execute("select sum(fee) from trades").fetchone()[0] - fee1
     assert abs(equity_of(st, px) - (before - fee2)) < 1e-9 and "A" not in st["pos"]
     # ATR filter off -> empty target -> everything closed, equity moves only by fees
     compute_signal = lambda t: (pd.Timestamp("2026-01-03", tz="UTC"), {}, [], dict(FAKE_F, atr_on=False))
     before = equity_of(state(), px); f0 = CON.execute("select sum(fee) from trades").fetchone()[0]
-    rebalance(); st = state()
+    rebalance(sync=True); st = state()
     assert not st["pos"] and abs(st["cash"] - (before - (CON.execute("select sum(fee) from trades").fetchone()[0] - f0))) < 1e-9
     compute_signal = lambda t: (pd.Timestamp("2026-01-04", tz="UTC"), {"C": 0.5, "B": -0.5}, [], FAKE_F)
-    rebalance(); st = state()
+    rebalance(sync=True); st = state()
     # a short receives positive funding
     get = lambda path, **k: [{"fundingTime": now_ms() - 1, "fundingRate": "0.001", "markPrice": "22"}] if k["symbol"] == "B" else []
     st = state(); st["fund_from"]["B"] = 0; c0 = st["cash"]; settle_funding(st)
@@ -509,12 +582,41 @@ def selfcheck():
     compute_signal = lambda t: (pd.Timestamp("2026-01-05", tz="UTC"), {"A": 0.5, "C": -0.5}, [], FAKE_F)
     before = equity_of(state(), px); f0 = CON.execute("select sum(fee) from trades").fetchone()[0]
     r0 = CON.execute("select max(rowid) from trades").fetchone()[0]
-    rebalance(); st = state()
+    rebalance(sync=True); st = state()
     tr = CON.execute("select sym, qty, price, mark from trades where rowid > ?", (r0,)).fetchall()
     assert all((p > m) if q > 0 else (p < m) for _, q, p, m in tr), tr               # buys at ask, sells at bid
     spread_cost = sum(abs(q) * abs(p - m) for _, q, p, m in tr)
     fee = CON.execute("select sum(fee) from trades").fetchone()[0] - f0
     assert spread_cost > 0 and abs(equity_of(st, px) - (before - fee - spread_cost)) < 1e-9
+    # executor path: A normal spread -> post at bid, filled when a trade prints below it; B 1 % spread + no funding -> skipped
+    class FakeSession:
+        def __init__(self, orders, on_fill, on_update, first_book):
+            self.e, self.f, self.u, self.b = executor.Engine(orders), on_fill, on_update, first_book
+        def start(self):
+            t1 = time.time()
+            for sym, (bb, aa) in self.b.items():
+                for o in self.e.on_book(sym, bb, aa, t1):
+                    self.f(o)
+            for o in self.e.on_trade("A", self.b["A"][0] * 0.999, t1 + 3):
+                self.f(o)
+            for o in self.e.orders.values():
+                self.u(o)
+        def is_alive(self):
+            return False
+    executor.Session = FakeSession
+    CON.execute("delete from trades"); CON.execute("delete from funding")
+    set_kv("cash", START_EQUITY); set_kv("pos", {}); set_kv("entry", {}); set_kv("fund_from", {}); set_kv("opened", {})
+    px.update(A=10.0, B=20.0)
+    book_prices = lambda: {"A": (9.99, 10.01), "B": (19.9, 20.1)}
+    compute_signal = lambda t: (pd.Timestamp("2026-01-06", tz="UTC"), {"A": 0.5, "B": -0.5}, [], FAKE_F)
+    rebalance()
+    st = state()
+    od = dict(CON.execute("select sym, status from orders where reb_ts=(select max(reb_ts) from orders)").fetchall())
+    assert od == {"A": "filled_maker", "B": "skipped"}, od
+    assert "B" not in st["pos"] and abs(st["pos"]["A"] * 10 - 500) < 1e-6
+    fill, fee = CON.execute("select price, fee from trades where sym='A'").fetchone()
+    assert fill == 9.99 and abs(fee - st["pos"]["A"] * 9.99 * executor.MAKER_BPS / 1e4) < 1e-12        # maker fee
+    assert abs(st["cash"] - (START_EQUITY - st["pos"]["A"] * 9.99 - fee)) < 1e-9
     print("fronttest selfcheck ok")
 
 

@@ -166,6 +166,7 @@ and a check that price + funding − fees equals the equity change. Logic in `st
 | `errors` | API or runtime errors |
 | `features` | market state of every top-100 coin at each rebalance: volume rank, 30d volume, ATR14, 30d vol, 1d/7d return, 7d funding, predicted funding, basis vs spot |
 | `marks` | mark price of every held coin every 15 min (worst/best move per trade) |
+| `orders` | every executor order: kind, status, limit, moves, spread and mid at start, expected funding, fill price/time, fee, reason |
 
 ### Move to a server
 
@@ -183,7 +184,15 @@ max DD −61% → −38%, 31 separate off-episodes). Shadow (logged, not applied
 its backtest benefit comes almost entirely from one episode (the Oct 2023 – Apr 2024 ETF rally), so it has to earn its place live.
 Both values are in the `filters` table and match the backtest values exactly on 2025-03-10, 2026-08-20 and 2026-08-30.
 
-**Fills (since 2026-09-26):** buy at the real best ask, sell at the real best bid (`/fapi/v1/ticker/bookTicker`, weight 5 per
+**Executor (`executor.py`, since 2026-09-26):** every order first rests as a post-only maker order at the touch (buy at best
+bid, sell at best ask). It fills only when a real trade prints *through* its price (strict: no queue guessing). If the market
+runs away by more than 0.3 % the order moves to the new touch; after 20 min unfilled it becomes a market order; after 6 h it
+takes whatever the spread. If the spread is 0.3 % or wider, a new entry is skipped when the expected funding over 4 days is
+smaller than the cost of crossing, otherwise it waits for a normal spread; exits always wait, then execute.
+Maker fee 2 bps, taker 5 bps. Unfinished orders resume after a restart. Live test on a real rebalance: 41/41 maker fills,
+median 11 s, p90 44 s, 1 move in total, ~2.5 bps all-in vs ~6 bps for market orders. Stats page: section "Execution".
+
+**Fills before the executor:** buy at the real best ask, sell at the real best bid (`/fapi/v1/ticker/bookTicker`, weight 5 per
 rebalance), plus the 5 bps taker fee. Measured on a real rebalance: spread 3.0 bps + fee 5 bps = 8 bps, vs 7 bps assumed in the
 backtest. Earlier trades were filled at the mark price and stamped with the rebalance start time (both fixed).
 

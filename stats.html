@@ -49,6 +49,11 @@ input{background:var(--card);color:var(--ink);border:1px solid var(--line);borde
     <div><h2>Where the P&amp;L comes from</h2><div class="card scroll"><table id="parts"></table></div></div>
   </div>
 
+  <h2>Execution (post-only maker orders, repricing, market fallback)</h2>
+  <div class="grid" id="exk"></div>
+  <div class="card scroll" style="margin-top:10px"><table id="orders"></table>
+    <div class="note">Maker fill = a real trade printed through our price. "vs mid" = what we paid against the mid price at the start (+ = worse). A market order at the start would have paid half the spread plus 5 bps.</div></div>
+
   <h2>Daily P&amp;L</h2>
   <div class="card"><svg id="bars" role="img" aria-label="Daily P&L bars"></svg>
     <div class="scroll"><table id="daily"></table></div></div>
@@ -166,6 +171,23 @@ async function refresh(){
     ["Price (closed + open)", col(T.price_pnl, usd)], ["  of which spread paid on fills", usd(-(T.spread_paid || 0))], ["Funding", col(T.funding, usd)], ["Fees", usd(-T.fees)],
     ["= Net", col(T.net, usd)], ["Equity change", col(T.equity_change, usd)],
     ["Unexplained (should be ~0)", usd(T.unattributed)], ["Funding outside any trade (should be 0)", usd(T.funding_not_in_a_trade)]]);
+  const X = S.execution || {};
+  const ek = [["Orders", X.orders ?? 0], ["Maker fills", `${X.maker_fills ?? 0} (${fin(X.maker_share_pct) ? Math.round(X.maker_share_pct) : "–"}%)`],
+    ["Market fills", X.taker_fills ?? 0], ["Skipped", X.skipped ?? 0], ["Working now", X.working ?? 0],
+    ["Fill time median / p90", fin(X.fill_secs_median) ? `${Math.round(X.fill_secs_median)} s / ${Math.round(X.fill_secs_p90)} s` : "–"],
+    ["Moves avg / max", fin(X.moves_avg) ? `${num(X.moves_avg,1)} / ${X.moves_max}` : "–"],
+    ["Paid vs mid (avg)", fin(X.cost_vs_mid_bps_avg) ? num(X.cost_vs_mid_bps_avg,1) + " bps" : "–"],
+    ["Fees paid / if all market", fin(X.fees_paid) ? `${usd(X.fees_paid)} / ${usd(X.fees_if_all_taker)}` : "–"]];
+  $("exk").innerHTML = ek.map(([a,b]) => `<div class="card"><div class="k">${a}</div><div class="v">${b}</div></div>`).join("");
+  const stTag = s => ({filled_maker: '<span class="tag pos">MAKER</span>', filled_taker: '<span class="tag">MARKET</span>',
+    skipped: '<span class="tag neg">SKIPPED</span>'})[s] || `<span class="tag">${s}</span>`;
+  table($("orders"), [["Created", r => t(r.created)], ["Coin", r => nm(r.sym)], ["Kind", r => r.kind],
+    ["Side", r => r.qty > 0 ? "BUY" : "SELL"], ["Status", r => stTag(r.status)], ["Fill after", r => fin(r.secs) ? Math.round(r.secs) + " s" : "–"],
+    ["Moves", r => r.moves ?? 0], ["Spread at start", r => num(r.spread0_bps,1) + " bps"], ["Mid at start", r => num(r.mid0,6)],
+    ["Limit", r => num(r.limit_px,6)], ["Fill", r => num(r.fill_px,6)],
+    ["Size", r => fin(r.fill_px) ? usd(Math.abs(r.qty * r.fill_px)) : usd(Math.abs(r.qty * (r.mark0 || 0)))],
+    ["Fee", r => usd(r.fee)], ["Exp. funding", r => fin(r.est_funding_bps) ? num(r.est_funding_bps,1) + " bps" : ""],
+    ["Reason", r => r.reason || ""]], (S.orders || []).slice(0, 150));
   bars(S.daily);
   table($("daily"), [["Day (UTC)", r => r.day], ["Equity", r => usd(r.equity)], ["P&L", r => col(r.pnl, usd)], ["Return", r => col(r.ret_pct, pct)],
     ["Price", r => col(r.price_pnl, usd)], ["Funding", r => col(r.funding, usd)], ["Fees", r => usd(-r.fees)]], [...S.daily].reverse().slice(0, 60));
