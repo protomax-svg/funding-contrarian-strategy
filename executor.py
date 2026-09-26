@@ -1,14 +1,14 @@
-"""Paper execution engine: post-only maker orders with repricing, taker fallback, wide-spread handling.
+"""Paper execution engine for WIDE-spread orders (normal-spread orders are market orders, done by the caller).
 
-Per order (qty signed: + buy, - sell):
-  spread < WIDE_BPS            -> post-only at the touch (buy at best bid, sell at best ask)
-  spread >= WIDE_BPS, entry    -> skip if the expected funding over HOLD_DAYS < cost of crossing the spread,
-                                  else wait for the spread to drop below WIDE_BPS, then post
-  spread >= WIDE_BPS, exit     -> wait for the spread to drop below WIDE_BPS, then post (never skipped)
-  resting order                -> filled only when a real trade prints THROUGH its price (strict: no queue guessing)
-                                  repriced to the touch when the market moves away by > REPRICE_PCT
-                                  after MAKER_TIMEOUT_S: market order if the spread is normal, else back to waiting
-  any order past DEADLINE_S    -> market order at the touch, whatever the spread
+Per order (qty signed: + buy, - sell), at the start:
+  spread < WIDE_BPS                  -> market order now (caller walks the real order book for the price impact)
+  spread >= SKIP_BPS and entry       -> skipped if the expected funding over HOLD_DAYS < cost of crossing the spread
+  spread >= WIDE_BPS                 -> post-only maker order at the touch (buy at best bid, sell at best ask)
+Resting order:
+  filled only when a real trade prints THROUGH its price (strict: no queue guessing)
+  repriced to the touch when the market runs away by > REPRICE_PCT
+  after MAKER_TIMEOUT_S unfilled     -> cancel, wait for the spread to drop below WIDE_BPS, then market order
+Any order past DEADLINE_S            -> market order, whatever the spread
 
 Engine is pure (feed it book/trade events, it returns fills), so it is unit-tested below.
 Session wraps it with one Binance websocket (bookTicker + aggTrade of the order's coins).
@@ -24,7 +24,8 @@ from websockets.sync.client import connect as ws_connect
 
 WS_PUBLIC = "wss://fstream.binance.com/public/stream?streams="   # bookTicker lives here
 WS_MARKET = "wss://fstream.binance.com/market/stream?streams="   # aggTrade lives here (the wrong path stays silent)
-WIDE_BPS = 30.0            # 0.3 %: at or above this the spread counts as wide
+WIDE_BPS = 30.0            # 0.3 %: at or above this the order goes post-only instead of market
+SKIP_BPS = 300.0           # 3 %: a new entry this wide is skipped when the expected funding does not pay for crossing
 REPRICE_PCT = 0.3          # move the resting order when the touch runs away by more than this
 MAKER_TIMEOUT_S = 20 * 60  # then market (if the spread allows)
 DEADLINE_S = 6 * 3600      # hard stop: market order regardless of spread
@@ -102,23 +103,22 @@ class Engine:
             if o.status == "new":
                 o.spread0_bps, o.mid0 = sp, (bid + ask) / 2
                 if sp < WIDE_BPS:
-                    self._post(o, now)
-                elif o.kind == "entry":
+                    fills.append(self._take(o, now, "normal spread"))
+                    continue
+                if sp >= SKIP_BPS and o.kind == "entry":
                     side = 1 if o.buy else -1
                     o.est_funding_bps = max(0.0, -side * (o.f7_bps or 0.0)) * HOLD_DAYS
                     cost = sp / 2 + TAKER_BPS
                     if o.est_funding_bps < cost:
                         o.status, o.reason = "skipped", f"spread {sp:.0f} bps, expected funding {o.est_funding_bps:.1f} < cost {cost:.1f} bps"
-                    else:
-                        o.status = "waiting_spread"
-                else:
-                    o.status = "waiting_spread"
+                        continue
+                self._post(o, now)
                 continue
             age = now - o.created
             if age >= DEADLINE_S:
                 fills.append(self._take(o, now, "deadline"))
             elif o.status == "waiting_spread" and sp < WIDE_BPS:
-                self._post(o, now)
+                fills.append(self._take(o, now, "spread normalised after maker timeout"))
             elif o.status == "resting":
                 away = (bid > o.limit * (1 + REPRICE_PCT / 100)) if o.buy else (ask < o.limit * (1 - REPRICE_PCT / 100))
                 if away:
@@ -127,7 +127,7 @@ class Engine:
                     if sp < WIDE_BPS:
                         fills.append(self._take(o, now, "maker timeout"))
                     else:
-                        o.status, o.limit = "waiting_spread", None
+                        o.status, o.limit = "waiting_spread", None      # cancel, wait for a normal spread
         return fills
 
     def on_trade(self, sym, price, now):
@@ -227,52 +227,56 @@ class Session(threading.Thread):
 
 
 if __name__ == "__main__":
-    # unit tests on synthetic events
     t0 = 1_000_000.0
 
     def mk(qty, kind="entry", f7=0.0, oid=1):
         return Order(id=oid, sym="X", qty=qty, kind=kind, created=t0, f7_bps=f7)
 
-    # 1) normal spread: post at bid, a trade AT the bid does not fill, a trade below does (maker fee)
+    # 1) normal spread (2 bps) -> market order at once, taker fee
     e = Engine([mk(+10)])
-    e.on_book("X", 100.0, 100.02, t0)
+    f = e.on_book("X", 100.0, 100.02, t0)
+    assert f and f[0].status == "filled_taker" and f[0].fill_px == 100.02 and f[0].reason == "normal spread"
+    assert abs(f[0].fee - 10 * 100.02 * TAKER_BPS / 1e4) < 1e-12
+
+    # 2) wide spread (50 bps) -> post-only at the bid; a trade AT the bid does not fill, one below does (maker fee)
+    e = Engine([mk(+10)])
+    assert not e.on_book("X", 100.0, 100.5, t0)
     o = e.orders[1]
     assert o.status == "resting" and o.limit == 100.0
-    assert not e.on_trade("X", 100.0, t0 + 1) and o.status == "resting"
-    f = e.on_trade("X", 99.99, t0 + 2)
-    assert f and o.status == "filled_maker" and o.fill_px == 100.0 and abs(o.fee - 10 * 100 * 2e-4) < 1e-12
+    assert not e.on_trade("X", 100.0, t0 + 1)
+    assert e.on_trade("X", 99.99, t0 + 2) and o.status == "filled_maker" and o.fill_px == 100.0
+    assert abs(o.fee - 10 * 100.0 * MAKER_BPS / 1e4) < 1e-12
 
-    # 2) market runs away up by > 0.3 %: reprice to the new bid, count the move
+    # 3) wide spread, market runs away up by > 0.3 %: reprice to the new bid and count the move
     e = Engine([mk(+10)])
-    e.on_book("X", 100.0, 100.02, t0)
-    e.on_book("X", 100.2, 100.22, t0 + 10)            # 0.2 %: stays
+    e.on_book("X", 100.0, 100.5, t0)
+    e.on_book("X", 100.2, 100.7, t0 + 10)
     assert e.orders[1].limit == 100.0 and e.orders[1].moves == 0
-    e.on_book("X", 100.5, 100.52, t0 + 20)            # 0.5 %: moves
+    e.on_book("X", 100.5, 101.0, t0 + 20)
     assert e.orders[1].limit == 100.5 and e.orders[1].moves == 1
 
-    # 3) no fill for 20 min with a normal spread -> taker at the ask
+    # 4) not filled after 20 min, spread still wide -> cancel and wait; spread normalises -> market order
     e = Engine([mk(-10, "exit")])
-    e.on_book("X", 100.0, 100.02, t0)
-    f = e.on_book("X", 100.0, 100.02, t0 + MAKER_TIMEOUT_S + 1)
-    assert f and f[0].status == "filled_taker" and f[0].fill_px == 100.0 and f[0].reason == "maker timeout"
-
-    # 4) wide spread entry with tiny funding -> skipped; with big funding -> waits, then posts when it narrows
-    e = Engine([mk(-10, "entry", f7=1.0, oid=1), mk(-10, "entry", f7=20.0, oid=2)])
-    e.on_book("X", 100.0, 101.0, t0)                  # ~100 bps spread; short receives +f7
-    assert e.orders[1].status == "skipped" and e.orders[2].status == "waiting_spread"
-    e.on_book("X", 100.0, 100.1, t0 + 60)             # 10 bps -> post the sell at the ask
-    assert e.orders[2].status == "resting" and e.orders[2].limit == 100.1
-
-    # 5) wide-spread exit is never skipped; past the 6 h deadline it takes whatever the spread
-    e = Engine([mk(+10, "exit")])
-    e.on_book("X", 100.0, 102.0, t0)
+    e.on_book("X", 100.0, 100.5, t0)
+    assert not e.on_book("X", 100.0, 100.5, t0 + MAKER_TIMEOUT_S + 1)
     assert e.orders[1].status == "waiting_spread"
-    f = e.on_book("X", 100.0, 102.0, t0 + DEADLINE_S + 1)
-    assert f and f[0].status == "filled_taker" and f[0].fill_px == 102.0 and f[0].reason == "deadline"
+    f = e.on_book("X", 100.0, 100.02, t0 + MAKER_TIMEOUT_S + 60)
+    assert f and f[0].status == "filled_taker" and f[0].fill_px == 100.0
 
-    # 6) a sell only fills when a trade prints ABOVE its ask price
+    # 5) huge spread (3 %+) entry: tiny funding -> skipped; big funding -> post-only; exits are never skipped
+    e = Engine([mk(-10, "entry", f7=1.0, oid=1), mk(-10, "entry", f7=200.0, oid=2), mk(+10, "exit", oid=3)])
+    e.on_book("X", 100.0, 104.0, t0)                  # ~392 bps
+    assert e.orders[1].status == "skipped" and e.orders[2].status == "resting" and e.orders[3].status == "resting"
+
+    # 6) past the 6 h deadline -> market order whatever the spread
+    e = Engine([mk(+10, "exit")])
+    e.on_book("X", 100.0, 101.0, t0)
+    f = e.on_book("X", 100.0, 101.0, t0 + DEADLINE_S + 1)
+    assert f and f[0].status == "filled_taker" and f[0].fill_px == 101.0 and f[0].reason == "deadline"
+
+    # 7) a resting sell fills only when a trade prints ABOVE its price
     e = Engine([mk(-5, "exit")])
-    e.on_book("X", 50.0, 50.01, t0)
-    assert not e.on_trade("X", 50.01, t0 + 1)
-    assert e.on_trade("X", 50.02, t0 + 2) and e.orders[1].fill_px == 50.01
+    e.on_book("X", 50.0, 50.3, t0)
+    assert not e.on_trade("X", 50.3, t0 + 1)
+    assert e.on_trade("X", 50.31, t0 + 2) and e.orders[1].fill_px == 50.3
     print("executor selfcheck ok")

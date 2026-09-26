@@ -52,7 +52,7 @@ input{background:var(--card);color:var(--ink);border:1px solid var(--line);borde
   <h2>Execution (post-only maker orders, repricing, market fallback)</h2>
   <div class="grid" id="exk"></div>
   <div class="card scroll" style="margin-top:10px"><table id="orders"></table>
-    <div class="note">Maker fill = a real trade printed through our price. "vs mid" = what we paid against the mid price at the start (+ = worse). A market order at the start would have paid half the spread plus 5 bps.</div></div>
+    <div class="note">Spread under 0.3 %: market order at once, priced by walking the real order book (impact = half spread + book walk). Spread 0.3 % or more: post-only maker order, filled only when a real trade prints through it. "Impact vs mid" / "Paid vs mid" = fill against the mid price at the start (+ = worse), fees not included.</div></div>
 
   <h2>Daily P&amp;L</h2>
   <div class="card"><svg id="bars" role="img" aria-label="Daily P&L bars"></svg>
@@ -184,7 +184,7 @@ async function refresh(){
   table($("orders"), [["Created", r => t(r.created)], ["Coin", r => nm(r.sym)], ["Kind", r => r.kind],
     ["Side", r => r.qty > 0 ? "BUY" : "SELL"], ["Status", r => stTag(r.status)], ["Fill after", r => fin(r.secs) ? Math.round(r.secs) + " s" : "–"],
     ["Moves", r => r.moves ?? 0], ["Spread at start", r => num(r.spread0_bps,1) + " bps"], ["Mid at start", r => num(r.mid0,6)],
-    ["Limit", r => num(r.limit_px,6)], ["Fill", r => num(r.fill_px,6)],
+    ["Limit", r => num(r.limit_px,6)], ["Fill", r => num(r.fill_px,6)], ["Impact vs mid", r => fin(r.impact_bps) ? num(r.impact_bps,1) + " bps" : "–"],
     ["Size", r => fin(r.fill_px) ? usd(Math.abs(r.qty * r.fill_px)) : usd(Math.abs(r.qty * (r.mark0 || 0)))],
     ["Fee", r => usd(r.fee)], ["Exp. funding", r => fin(r.est_funding_bps) ? num(r.est_funding_bps,1) + " bps" : ""],
     ["Reason", r => r.reason || ""]], (S.orders || []).slice(0, 150));

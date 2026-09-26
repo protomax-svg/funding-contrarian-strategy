@@ -79,6 +79,27 @@ def book_prices():
     return {d["symbol"]: (float(d["bidPrice"]), float(d["askPrice"])) for d in get("/fapi/v1/ticker/bookTicker")}
 
 
+def depth_fill(s, d, bid, ask):
+    """Market order price with impact: walk the real top-20 order book for |d| units (weight 2).
+    Returns (vwap, levels used). Falls back to the touch if the book is unavailable."""
+    touch = ask if d > 0 else bid
+    try:
+        ob = get("/fapi/v1/depth", symbol=s, limit=20)
+        lv = [(float(p_), float(q_)) for p_, q_ in (ob["asks"] if d > 0 else ob["bids"])]
+    except Exception:
+        return touch, 0
+    need, cost, used = abs(d), 0.0, 0
+    for p_, q_ in lv:
+        take = min(need, q_)
+        cost, need, used = cost + take * p_, need - take, used + 1
+        if need <= 1e-15:
+            break
+    if need > 1e-15:                      # deeper than 20 levels: price the rest 1 % beyond the last level
+        last = lv[-1][0] if lv else touch
+        cost += need * last * (1.01 if d > 0 else 0.99)
+    return cost / abs(d), used
+
+
 def mark_prices():
     """Websocket cache; REST (weight 10) only while the stream is down."""
     if time.time() - WS["ts"] < 60 and PX:
@@ -204,7 +225,9 @@ def db():
     create table if not exists orders(id integer primary key autoincrement, reb_ts int, sym text, qty real, kind text,
                                       f7_bps real, created int, status text, limit_px real, moves int, placed int,
                                       spread0_bps real, mid0 real, est_funding_bps real, fill_px real, fill_ts int,
-                                      fee real, reason text, mark0 real);""")
+                                      fee real, reason text, mark0 real, impact_bps real);""")
+    if "impact_bps" not in [r[1] for r in c.execute("pragma table_info(orders)")]:
+        c.execute("alter table orders add column impact_bps real")
     if "mark" not in [r[1] for r in c.execute("pragma table_info(trades)")]:
         c.execute("alter table trades add column mark real")     # older DBs: fills before this change were at mark
     return c
@@ -281,12 +304,15 @@ def apply_fill(st, s, d, fill, fee, t, mark):
 
 
 SESSION = {"s": None}
-ORDER_COLS = ("status", "limit_px", "moves", "placed", "spread0_bps", "mid0", "est_funding_bps", "fill_px", "fill_ts", "fee", "reason")
+ORDER_COLS = ("status", "limit_px", "moves", "placed", "spread0_bps", "mid0", "est_funding_bps", "fill_px", "fill_ts", "fee",
+              "reason", "impact_bps")
 
 
 def _order_row(o):
     ms = lambda x: int(x * 1000) if x else None
-    return (o.status, o.limit, o.moves, ms(o.placed), o.spread0_bps, o.mid0, o.est_funding_bps, o.fill_px, ms(o.fill_ts), o.fee, o.reason)
+    impact = (1e4 * (o.fill_px / o.mid0 - 1) * (1 if o.qty > 0 else -1)) if o.fill_px and o.mid0 else None
+    return (o.status, o.limit, o.moves, ms(o.placed), o.spread0_bps, o.mid0, o.est_funding_bps, o.fill_px, ms(o.fill_ts), o.fee,
+            o.reason, impact)
 
 
 def on_order_update(o):
@@ -296,6 +322,9 @@ def on_order_update(o):
 
 
 def on_order_fill(o):
+    if o.status == "filled_taker":        # engine priced it at the touch; use the real book for the impact
+        o.fill_px, _ = depth_fill(o.sym, o.qty, o.fill_px, o.fill_px)
+        o.fee = abs(o.qty) * o.fill_px * executor.TAKER_BPS / 1e4
     with lock:
         st = state()
         apply_fill(st, o.sym, o.qty, o.fill_px, o.fee, int(o.fill_ts * 1000), PX.get(o.sym))
@@ -348,6 +377,20 @@ def rebalance(sync=False):
             if abs(d * px[s]) < 1e-6:
                 continue
             kind = "entry" if q_old == 0 else "exit" if q_new == 0 else "flip" if np.sign(q_old) != np.sign(q_new) else "resize"
+            bid, ask = book.get(s, (0.0, 0.0))
+            sp = executor.spread_bps(bid, ask)
+            if not sync and s in book and sp < executor.WIDE_BPS:
+                # normal spread: market order now, priced by walking the real order book (price impact)
+                fill, levels = depth_fill(s, d, bid, ask)
+                fee = abs(d) * fill * executor.TAKER_BPS / 1e4
+                fees += fee
+                apply_fill(st, s, d, fill, fee, t, px[s])
+                mid = (bid + ask) / 2
+                CON.execute("insert into orders(reb_ts, sym, qty, kind, f7_bps, created, status, mark0, spread0_bps, mid0, "
+                            "fill_px, fill_ts, fee, reason, impact_bps, moves) values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)",
+                            (t, s, d, kind, f7.get(s), t, "filled_taker", px[s], sp, mid, fill, t, fee,
+                             f"normal spread, {levels} book level(s)", 1e4 * (fill / mid - 1) * (1 if d > 0 else -1)))
+                continue
             if sync or s not in book:
                 bid, ask = book.get(s, (0.0, 0.0))
                 fill = (ask if d > 0 else bid) if bid > 0 and ask > 0 else px[s]    # cross the real spread
@@ -588,7 +631,9 @@ def selfcheck():
     spread_cost = sum(abs(q) * abs(p - m) for _, q, p, m in tr)
     fee = CON.execute("select sum(fee) from trades").fetchone()[0] - f0
     assert spread_cost > 0 and abs(equity_of(st, px) - (before - fee - spread_cost)) < 1e-9
-    # executor path: A normal spread -> post at bid, filled when a trade prints below it; B 1 % spread + no funding -> skipped
+    # A normal spread -> market order now (touch, since the depth stub is empty), taker fee
+    # B 1 % spread -> post-only at the ask, filled by a trade printed above it, maker fee
+    # C 4 % spread, new entry, no funding -> skipped
     class FakeSession:
         def __init__(self, orders, on_fill, on_update, first_book):
             self.e, self.f, self.u, self.b = executor.Engine(orders), on_fill, on_update, first_book
@@ -597,7 +642,7 @@ def selfcheck():
             for sym, (bb, aa) in self.b.items():
                 for o in self.e.on_book(sym, bb, aa, t1):
                     self.f(o)
-            for o in self.e.on_trade("A", self.b["A"][0] * 0.999, t1 + 3):
+            for o in self.e.on_trade("B", self.b["B"][1] * 1.001, t1 + 3):
                 self.f(o)
             for o in self.e.orders.values():
                 self.u(o)
@@ -606,17 +651,22 @@ def selfcheck():
     executor.Session = FakeSession
     CON.execute("delete from trades"); CON.execute("delete from funding")
     set_kv("cash", START_EQUITY); set_kv("pos", {}); set_kv("entry", {}); set_kv("fund_from", {}); set_kv("opened", {})
-    px.update(A=10.0, B=20.0)
-    book_prices = lambda: {"A": (9.99, 10.01), "B": (19.9, 20.1)}
-    compute_signal = lambda t: (pd.Timestamp("2026-01-06", tz="UTC"), {"A": 0.5, "B": -0.5}, [], FAKE_F)
+    px.update(A=10.0, B=20.0, C=5.0)
+    book_prices = lambda: {"A": (9.99, 10.01), "B": (19.9, 20.1), "C": (4.9, 5.1)}
+    compute_signal = lambda t: (pd.Timestamp("2026-01-06", tz="UTC"), {"A": 0.5, "B": -0.25, "C": -0.25}, [], FAKE_F)
     rebalance()
     st = state()
     od = dict(CON.execute("select sym, status from orders where reb_ts=(select max(reb_ts) from orders)").fetchall())
-    assert od == {"A": "filled_maker", "B": "skipped"}, od
-    assert "B" not in st["pos"] and abs(st["pos"]["A"] * 10 - 500) < 1e-6
-    fill, fee = CON.execute("select price, fee from trades where sym='A'").fetchone()
-    assert fill == 9.99 and abs(fee - st["pos"]["A"] * 9.99 * executor.MAKER_BPS / 1e4) < 1e-12        # maker fee
-    assert abs(st["cash"] - (START_EQUITY - st["pos"]["A"] * 9.99 - fee)) < 1e-9
+    assert od == {"A": "filled_taker", "B": "filled_maker", "C": "skipped"}, od
+    fa = CON.execute("select price, fee from trades where sym='A'").fetchone()
+    fb = CON.execute("select price, fee from trades where sym='B'").fetchone()
+    assert fa[0] == 10.01 and abs(fa[1] - st["pos"]["A"] * 10.01 * executor.TAKER_BPS / 1e4) < 1e-12
+    assert fb[0] == 20.1 and abs(fb[1] - abs(st["pos"]["B"]) * 20.1 * executor.MAKER_BPS / 1e4) < 1e-12
+    assert "C" not in st["pos"]
+    imp = CON.execute("select impact_bps from orders where sym='A' order by id desc").fetchone()[0]
+    assert abs(imp - 1e4 * (10.01 / 10.0 - 1)) < 1e-9                                # half spread = 10 bps here
+    cash = START_EQUITY - st["pos"]["A"] * 10.01 - fa[1] - st["pos"]["B"] * 20.1 - fb[1]
+    assert abs(st["cash"] - cash) < 1e-9
     print("fronttest selfcheck ok")
 
 

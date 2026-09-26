@@ -184,13 +184,17 @@ max DD −61% → −38%, 31 separate off-episodes). Shadow (logged, not applied
 its backtest benefit comes almost entirely from one episode (the Oct 2023 – Apr 2024 ETF rally), so it has to earn its place live.
 Both values are in the `filters` table and match the backtest values exactly on 2025-03-10, 2026-08-20 and 2026-08-30.
 
-**Executor (`executor.py`, since 2026-09-26):** every order first rests as a post-only maker order at the touch (buy at best
-bid, sell at best ask). It fills only when a real trade prints *through* its price (strict: no queue guessing). If the market
-runs away by more than 0.3 % the order moves to the new touch; after 20 min unfilled it becomes a market order; after 6 h it
-takes whatever the spread. If the spread is 0.3 % or wider, a new entry is skipped when the expected funding over 4 days is
-smaller than the cost of crossing, otherwise it waits for a normal spread; exits always wait, then execute.
-Maker fee 2 bps, taker 5 bps. Unfinished orders resume after a restart. Live test on a real rebalance: 41/41 maker fills,
-median 11 s, p90 44 s, 1 move in total, ~2.5 bps all-in vs ~6 bps for market orders. Stats page: section "Execution".
+**Execution (`executor.py`, since 2026-09-26):**
+- Spread under 0.3 %: market order at once, priced by walking the real top-20 order book (`/fapi/v1/depth`, weight 2)
+  for the order size, so the price impact is real; taker fee 5 bps.
+- Spread 0.3 % or more: post-only maker order at the touch (buy at best bid, sell at best ask), filled only when a real
+  trade prints *through* its price; moved to the new touch after a 0.3 % run-away; after 20 min unfilled it is cancelled
+  and waits for a normal spread, then goes to market; after 6 h it goes to market whatever the spread. Maker fee 2 bps.
+- Spread 3 % or more on a new entry: skipped if 4 days of expected funding do not pay for crossing the spread.
+- Unfinished orders resume after a restart. Every order is in the `orders` table (status, moves, spread and mid at start,
+  fill, impact vs mid, fee, reason) and on the stats page ("Execution").
+- Real rebalance test: all 41 orders had a normal spread -> market; impact vs mid median 2.3 bps (max 14 bps),
+  10 of 41 walked more than one book level; audit: all checks pass.
 
 **Fills before the executor:** buy at the real best ask, sell at the real best bid (`/fapi/v1/ticker/bookTicker`, weight 5 per
 rebalance), plus the 5 bps taker fee. Measured on a real rebalance: spread 3.0 bps + fee 5 bps = 8 bps, vs 7 bps assumed in the
