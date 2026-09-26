@@ -183,5 +183,14 @@ max DD −61% → −38%, 31 separate off-episodes). Shadow (logged, not applied
 its backtest benefit comes almost entirely from one episode (the Oct 2023 – Apr 2024 ETF rally), so it has to earn its place live.
 Both values are in the `filters` table and match the backtest values exactly on 2025-03-10, 2026-08-20 and 2026-08-30.
 
+**Fills (since 2026-09-26):** buy at the real best ask, sell at the real best bid (`/fapi/v1/ticker/bookTicker`, weight 5 per
+rebalance), plus the 5 bps taker fee. Measured on a real rebalance: spread 3.0 bps + fee 5 bps = 8 bps, vs 7 bps assumed in the
+backtest. Earlier trades were filled at the mark price and stamped with the rebalance start time (both fixed).
+
+**Audit:** `python audit.py fronttest.db` re-derives everything from Binance with independent code (no imports from the
+fronttest): cash and positions from the trade log, every real funding event while a position was open (missing / extra /
+double / wrong amount), every fill vs the real 1-minute range, look-ahead (signal day, saved close, 7d funding from raw events),
+and that positions match the signal. It caught 5 of 5 deliberate corruptions of a test DB.
+
 Differences from the backtest: rebalances to target from actual holdings (includes drift, so turnover is a bit higher);
 fills at mark price with flat 7 bps (no order book). The first rebalance happened mid-day (2026-09-23 17:41 UTC) on the 09-22 signal.

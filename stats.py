@@ -197,6 +197,9 @@ def compute(con, marks_now, start_equity, equity_now):
              "funding": float(E.funding.sum()) if len(E) else 0.0, "fees": float(E.fees.sum()) if len(E) else 0.0}
     parts["net"] = parts["price_pnl"] + parts["funding"] - parts["fees"]
     total_fund = float(con.execute("select coalesce(sum(payment),0) from funding").fetchone()[0])
+    cols = [r[1] for r in con.execute("pragma table_info(trades)")]
+    parts["spread_paid"] = float(con.execute("select coalesce(sum(abs(qty) * abs(price - mark)), 0) from trades "
+                                             "where mark is not null").fetchone()[0]) if "mark" in cols else 0.0
     parts["equity_change"] = (equity_now - start_equity) if equity_now is not None else None
     parts["unattributed"] = (parts["equity_change"] - parts["net"]) if equity_now is not None else None
     parts["funding_not_in_a_trade"] = total_fund - parts["funding"]

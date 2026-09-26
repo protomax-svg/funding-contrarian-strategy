@@ -163,7 +163,7 @@ async function refresh(){
     ["Win rate", r => fin(r.win_rate) ? Math.round(100*r.win_rate)+"%" : "–"], ["Avg hold h", r => num(r.avg_hold_h,0)],
     ["Avg MAE", r => pct(r.avg_mae_pct)], ["Worst MAE", r => col(r.worst_mae_pct, pct)]], S.sides);
   table($("parts"), [["Part", r => r[0]], ["Amount", r => r[1]]], [
-    ["Price (closed + open)", col(T.price_pnl, usd)], ["Funding", col(T.funding, usd)], ["Fees", usd(-T.fees)],
+    ["Price (closed + open)", col(T.price_pnl, usd)], ["  of which spread paid on fills", usd(-(T.spread_paid || 0))], ["Funding", col(T.funding, usd)], ["Fees", usd(-T.fees)],
     ["= Net", col(T.net, usd)], ["Equity change", col(T.equity_change, usd)],
     ["Unexplained (should be ~0)", usd(T.unattributed)], ["Funding outside any trade (should be 0)", usd(T.funding_not_in_a_trade)]]);
   bars(S.daily);

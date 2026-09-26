@@ -33,7 +33,7 @@ DB = Path(os.environ.get("FRONTTEST_DB", HERE / "fronttest.db"))
 HOST = os.environ.get("FRONTTEST_HOST", "127.0.0.1")    # 0.0.0.0 on a server behind a firewall/proxy
 PORT = int(os.environ.get("FRONTTEST_PORT", 8770))
 START_EQUITY = 1_000.0
-COST_BPS = 7.0
+FEE_BPS = 5.0                # Binance USDT-M taker fee; the spread is paid for real (buy at ask, sell at bid)
 SNAP_S = 60                  # equity row in the DB every minute (prices themselves are live, every 3 s)
 MARK_S = 900                 # mark of every held coin every 15 min -> worst/best move per trade (stats page)
 LOOKBACK, TOP_N, Q = 7, 100, 0.2
@@ -71,6 +71,11 @@ def tradable_symbols():
     return sorted(s["symbol"] for s in info["symbols"]
                   if s["status"] == "TRADING" and s["contractType"] == "PERPETUAL"
                   and s["quoteAsset"] == "USDT" and s.get("underlyingType") == "COIN")
+
+
+def book_prices():
+    """Best bid/ask of every perp in one call (weight 5), used only for fills at the daily rebalance."""
+    return {d["symbol"]: (float(d["bidPrice"]), float(d["askPrice"])) for d in get("/fapi/v1/ticker/bookTicker")}
 
 
 def mark_prices():
@@ -168,7 +173,7 @@ def compute_signal(now_ms):
     rows = []
     for s in P["close"].columns:
         if U[s].iloc[-1]:
-            rows.append({"sym": s, "f7_bps_day": round(1e4 * f7[s].iloc[-1], 3), "weight": round(float(w[s]), 4),
+            rows.append({"sym": s, "f7_bps_day": round(1e4 * f7[s].iloc[-1], 3), "weight": float(w[s]),
                          "rank_vol": fin(rank[s], 1, 0), "adv30_musd": fin(adv[s], 1e-6, 2), "close": fin(C[s].iloc[-1], 1, 10),
                          "atr14_pct": fin(atr[s], 100, 3), "vol30_pct": fin(vol30[s], 100, 2),
                          "ret1d_pct": fin(r1[s], 100, 3), "ret7d_pct": fin(r7[s], 100, 3)})
@@ -195,6 +200,8 @@ def db():
                                         weight real, mark real, pred_funding_bps real, basis_bps real);
     create table if not exists marks(ts int, sym text, mark real);
     create index if not exists marks_sym_ts on marks(sym, ts);""")
+    if "mark" not in [r[1] for r in c.execute("pragma table_info(trades)")]:
+        c.execute("alter table trades add column mark real")     # older DBs: fills before this change were at mark
     return c
 
 
@@ -253,11 +260,16 @@ def settle_funding(st, syms=None):
 
 def rebalance():
     t = now_ms()
-    day, target_w, rows, filt = compute_signal(t)
+    day, target_w, rows, filt = compute_signal(t)     # uses only data from before t
     with lock:
+        t = now_ms()                                   # fills happen now (the download above takes minutes)
         st = state()
         settle_funding(st)                       # old positions collect the 00:00 settlement first
         px = mark_prices()
+        try:
+            book = book_prices()
+        except Exception:
+            book = {}                              # no book -> fill at mark (logged as a fill with zero spread)
         eq = equity_of(st, px)
         fees = 0.0
         for s in sorted(set(st["pos"]) | set(target_w)):
@@ -268,18 +280,20 @@ def rebalance():
             d = q_new - q_old
             if abs(d * px[s]) < 1e-6:
                 continue
-            fee = abs(d) * px[s] * COST_BPS / 1e4
-            st["cash"] -= d * px[s] + fee
+            bid, ask = book.get(s, (0.0, 0.0))
+            fill = (ask if d > 0 else bid) if bid > 0 and ask > 0 else px[s]    # cross the real spread
+            fee = abs(d) * fill * FEE_BPS / 1e4
+            st["cash"] -= d * fill + fee
             fees += fee
-            CON.execute("insert into trades values(?,?,?,?,?)", (t, s, d, px[s], fee))
+            CON.execute("insert into trades(ts, sym, qty, price, fee, mark) values(?,?,?,?,?,?)", (t, s, d, fill, fee, px[s]))
             if abs(q_new) * px[s] < 1e-6:
                 for m in ("pos", "entry", "fund_from", "opened"):
                     st[m].pop(s, None)
                 continue
             if q_old == 0 or np.sign(q_old) != np.sign(q_new):
-                st["entry"][s] = px[s]; st["fund_from"][s] = t; st["opened"][s] = t
+                st["entry"][s] = fill; st["fund_from"][s] = t; st["opened"][s] = t
             elif abs(q_new) > abs(q_old):        # added on the same side: average in
-                st["entry"][s] = (st["entry"][s] * abs(q_old) + px[s] * abs(d)) / abs(q_new)
+                st["entry"][s] = (st["entry"][s] * abs(q_old) + fill * abs(d)) / abs(q_new)
             st["pos"][s] = q_new
         save(st)
         set_kv("last_day", str(day.date()))
@@ -322,7 +336,7 @@ def loop():
             # fresh DB: never trade mid-day on a stale signal; the first rebalance is the next 00:05 UTC
             set_kv("last_day", last_closed_day())
         # everything needed to audit or move the run lives in the DB itself
-        set_kv("rule", {"lookback_days": LOOKBACK, "top_n": TOP_N, "quantile": Q, "cost_bps": COST_BPS,
+        set_kv("rule", {"lookback_days": LOOKBACK, "top_n": TOP_N, "quantile": Q, "fee_bps": FEE_BPS, "fills": "buy at ask, sell at bid (bookTicker)",
                         "start_equity": START_EQUITY, "candidates": "all USDT-M perps with underlyingType COIN",
                         "atr_filter_shadow": {"off_below_pct": ATR_OFF_BELOW, "window_days": 365, "atr_n": 14},
                         "trend_filter_shadow": {"off_above_pct": TREND_OFF_ABOVE, "sma": 200, "window_days": 365}})
@@ -420,7 +434,7 @@ def api_state():
                 "feed": {"ws_age_s": round(time.time() - WS["ts"], 1) if WS["ts"] else None,
                          "ws_reconnects": WS["reconnects"], "rest_calls_1h": len(REST["calls"]),
                          "ip_weight_1m": REST["ip_weight_1m"]},
-                "rule": {"lookback_days": LOOKBACK, "top_n": TOP_N, "quantile": Q, "cost_bps": COST_BPS},
+                "rule": {"lookback_days": LOOKBACK, "top_n": TOP_N, "quantile": Q, "fee_bps": FEE_BPS},
                 "filter_history": q("select day, btc_atr_pct, btc_trend_pct, atr_on, trend_on_shadow from filters order by ts desc limit 60")}
 
 
@@ -454,14 +468,16 @@ def selfcheck():
     CON = db()
     px = {"A": 10.0, "B": 20.0, "C": 5.0}
     FAKE_F = {"day": "x", "btc_atr_pct": 0.5, "btc_trend_pct": 0.5, "atr_on": True, "trend_on_shadow": True}
+    global book_prices
     mark_prices = lambda: dict(px)
+    book_prices = lambda: {}                           # no book -> fills at mark, so the fee math below is exact
     compute_signal = lambda t: (pd.Timestamp("2026-01-01", tz="UTC"), {"A": 0.5, "B": -0.5}, [], FAKE_F)
     get = lambda path, **k: []                        # no funding events
     rebalance()
     st = state()
     fee1 = CON.execute("select sum(fee) from trades").fetchone()[0]
     assert abs(equity_of(st, px) - (START_EQUITY - fee1)) < 1e-9
-    assert abs(fee1 - START_EQUITY * 1.0 * COST_BPS / 1e4) < 1e-9          # gross 1.0 traded once
+    assert abs(fee1 - START_EQUITY * 1.0 * FEE_BPS / 1e4) < 1e-9           # gross 1.0 traded once
     assert abs(st["pos"]["A"] * px["A"] - 0.5 * (START_EQUITY - 0)) < 1e-6
     px["A"], px["B"] = 11.0, 22.0                                            # both +10%: long/short cancel
     assert abs(equity_of(st, px) - equity_of(st, {"A": 10.0, "B": 20.0})) < 1e-6
@@ -486,6 +502,19 @@ def selfcheck():
     on_mark([{"s": "B", "p": "22", "T": 1000}]); assert "B" not in DUE
     on_mark([{"s": "B", "p": "23", "T": 1000}]); assert "B" not in DUE and PX["B"] == 23.0
     on_mark([{"s": "B", "p": "23", "T": 2000}]); assert DUE["B"] == 1000          # rolled -> settlement at 1000
+    # real book: buying at the ask costs the half-spread at once (equity at mark drops by spread + fee)
+    get = lambda path, **k: []                        # no funding in this step
+    book_prices = lambda: {"A": (9.99, 10.01), "B": (19.98, 20.02), "C": (4.99, 5.01)}
+    px.update(A=10.0, B=20.0, C=5.0)
+    compute_signal = lambda t: (pd.Timestamp("2026-01-05", tz="UTC"), {"A": 0.5, "C": -0.5}, [], FAKE_F)
+    before = equity_of(state(), px); f0 = CON.execute("select sum(fee) from trades").fetchone()[0]
+    r0 = CON.execute("select max(rowid) from trades").fetchone()[0]
+    rebalance(); st = state()
+    tr = CON.execute("select sym, qty, price, mark from trades where rowid > ?", (r0,)).fetchall()
+    assert all((p > m) if q > 0 else (p < m) for _, q, p, m in tr), tr               # buys at ask, sells at bid
+    spread_cost = sum(abs(q) * abs(p - m) for _, q, p, m in tr)
+    fee = CON.execute("select sum(fee) from trades").fetchone()[0] - f0
+    assert spread_cost > 0 and abs(equity_of(st, px) - (before - fee - spread_cost)) < 1e-9
     print("fronttest selfcheck ok")
 
 
