@@ -9,10 +9,14 @@ real funding paid/received at every settlement. BTC ATR and trend filters are lo
 
 Signal logic is lab.universe + lab.xs_rank_weights + lab.drop_falling_longs on a live-built panel, so it cannot drift
 from the backtest. Run:  python fronttest.py   -> http://127.0.0.1:8770   (env: FRONTTEST_DB, FRONTTEST_HOST, FRONTTEST_PORT)
+The same process also runs the boost.py NEW rule as a parallel paper book (tab /?book=boost, own DB, shared data;
+FRONTTEST_EXTRA="" turns it off).
 """
+import importlib.util
 import json
 import os
 import sqlite3
+import sys
 import threading
 import time
 import traceback
@@ -35,14 +39,16 @@ DB = Path(os.environ.get("FRONTTEST_DB", HERE / "fronttest.db"))
 HOST = os.environ.get("FRONTTEST_HOST", "127.0.0.1")    # 0.0.0.0 on a server behind a firewall/proxy
 PORT = int(os.environ.get("FRONTTEST_PORT", 8770))
 # "funding" = the funding-contrarian book; "crash" = crash_short.py (short sharp-drop coins, EW-hedged), run as a
-# second process with its own FRONTTEST_DB and FRONTTEST_PORT (deploy/fronttest-crash.service)
+# second process with its own FRONTTEST_DB and FRONTTEST_PORT (deploy/fronttest-crash.service);
+# "boost" = boost.py NEW rule (lab.boost_weights), run inside the funding process as a parallel book (FRONTTEST_EXTRA)
 BOOK = os.environ.get("FRONTTEST_BOOK", "funding")
-assert BOOK in ("funding", "crash"), BOOK
+assert BOOK in ("funding", "crash", "boost"), BOOK
 START_EQUITY = 1_000.0
 FEE_BPS = 5.0                # Binance USDT-M taker fee; the spread is paid for real (buy at ask, sell at bid)
 SNAP_S = 60                  # equity row in the DB every minute (prices themselves are live, every 3 s)
 MARK_S = 900                 # mark of every held coin every 15 min -> worst/best move per trade (stats page)
-LOOKBACK, TOP_N, Q = 7, 100, 0.2
+LOOKBACK, TOP_N, Q = 7, 100, (1 / 3 if BOOK == "boost" else 0.2)
+BOOST_RULE = {"short_stays_while_top": 0.5, "weights": "1 / 30d vol", "cap_per_coin": 0.05, "excluded": list(lab.GOLD)}
 DROP_Q = 0.2                 # since 2026-09-28: no long in the worst 20% of the long leg by 7d return (ret7_test.py)
 ATR_OFF_BELOW = 1 / 3        # SHADOW: BTC ATR% in the low third of its last year (hurt on the full universe, alltest.py)
 TREND_OFF_ABOVE = 2 / 3      # SHADOW: logged only; BTC close/SMA200 in the top third of its last year
@@ -53,8 +59,18 @@ lock = threading.RLock()
 # live cache fed by the websocket (plain dict writes are atomic under the GIL)
 PX, NEXT_T, DUE = {}, {}, {}            # mark price; next funding time; symbol -> settlement time just passed
 IDX, RATE = {}, {}                      # spot index price; predicted funding rate of the running interval
-WS = {"ts": 0.0, "reconnects": 0, "sweep": True}
+WS = {"ts": 0.0, "reconnects": 0}
 REST = {"calls": [], "ip_weight_1m": None}   # our REST call times + last IP-wide weight Binance reported
+SWEEP = {"on": True}                    # book anything settled while the websocket was down (per book)
+LAST_SETTLE = {}                        # symbol -> last settlement time the websocket saw
+# Parallel books (FRONTTEST_EXTRA, default "boost" in the funding process): each one is a second copy of this module
+# (load_twin) with its own DB, state, lock and executor, sharing the feed above and these downloads. The daily panel is
+# shared both ways (first book to ask builds it); book ticker, order book, funding events and REST marks flow only
+# from the main book to the twins, so the main book's fills and bookings are exactly what they were without twins.
+TWIN = False
+TWINS, BOOKS = [], {}
+SHARED = {"panel": {}, "book": (0.0, {}), "depth": {}, "fund": {}, "marks": (0.0, {})}
+PANEL_LOCK = threading.Lock()
 
 
 # ---------------- binance (keyless public REST) ----------------
@@ -82,7 +98,13 @@ def tradable_symbols():
 
 def book_prices():
     """Best bid/ask of every perp in one call (weight 5), used only for fills at the daily rebalance."""
-    return {d["symbol"]: (float(d["bidPrice"]), float(d["askPrice"])) for d in get("/fapi/v1/ticker/bookTicker")}
+    t, b = SHARED["book"]
+    if TWIN and time.time() - t < 60:
+        return dict(b)
+    b = {d["symbol"]: (float(d["bidPrice"]), float(d["askPrice"])) for d in get("/fapi/v1/ticker/bookTicker")}
+    if not TWIN:
+        SHARED["book"] = (time.time(), b)
+    return b
 
 
 def depth_fill(s, d, bid, ask):
@@ -90,7 +112,13 @@ def depth_fill(s, d, bid, ask):
     Returns (vwap, levels used). Falls back to the touch if the book is unavailable."""
     touch = ask if d > 0 else bid
     try:
-        ob = get("/fapi/v1/depth", symbol=s, limit=20)
+        c = SHARED["depth"].get(s)
+        if TWIN and c and time.time() - c[0] < 30:
+            ob = c[1]
+        else:
+            ob = get("/fapi/v1/depth", symbol=s, limit=20)
+            if not TWIN:
+                SHARED["depth"][s] = (time.time(), ob)
         lv = [(float(p_), float(q_)) for p_, q_ in (ob["asks"] if d > 0 else ob["bids"])]
     except Exception:
         return touch, 0
@@ -110,7 +138,13 @@ def mark_prices():
     """Websocket cache; REST (weight 10) only while the stream is down."""
     if time.time() - WS["ts"] < 60 and PX:
         return dict(PX)
-    return {d["symbol"]: float(d["markPrice"]) for d in get("/fapi/v1/premiumIndex")}
+    t, m = SHARED["marks"]
+    if TWIN and time.time() - t < 10:
+        return dict(m)
+    m = {d["symbol"]: float(d["markPrice"]) for d in get("/fapi/v1/premiumIndex")}
+    if not TWIN:
+        SHARED["marks"] = (time.time(), m)
+    return m
 
 
 def on_mark(items):
@@ -124,7 +158,9 @@ def on_mark(items):
             RATE[sym] = float(d["r"])
         prev = NEXT_T.get(sym)
         if prev and t_next > prev:
-            DUE[sym] = prev
+            DUE[sym] = LAST_SETTLE[sym] = prev
+            for m in TWINS:
+                m.DUE[sym] = prev
         NEXT_T[sym] = t_next
     WS["ts"] = time.time()
 
@@ -133,7 +169,8 @@ def ws_loop():
     while True:
         try:
             with ws_connect(WS_URL, open_timeout=20, max_size=2 ** 22) as ws:
-                WS["sweep"] = True            # book anything settled while we were disconnected
+                for m in [sys.modules[__name__]] + TWINS:   # book anything settled while we were disconnected
+                    m.SWEEP["on"] = True
                 while True:
                     on_mark(json.loads(ws.recv(timeout=30)))   # silent stream -> TimeoutError -> reconnect
         except Exception as e:
@@ -185,13 +222,27 @@ def market_filter(now_ms):
             "atr_on": bool(not atr_p < ATR_OFF_BELOW), "trend_on_shadow": bool(not trend_p >= TREND_OFF_ABOVE)}
 
 
+def shared_panel(now_ms, days):
+    """The daily download (candidates, klines, funding, BTC filter), once per day for every book in this process."""
+    key = (str(pd.Timestamp(now_ms, unit="ms", tz="UTC").date()), days)
+    with PANEL_LOCK:
+        if key not in SHARED["panel"]:
+            SHARED["panel"] = {key: (build_panel(tradable_symbols(), now_ms, days), market_filter(now_ms))}
+        return SHARED["panel"][key]
+
+
 def compute_signal(now_ms):
-    P = build_panel(tradable_symbols(), now_ms, days=99 if BOOK == "funding" else 400)
+    P, filt = shared_panel(now_ms, 400 if BOOK == "crash" else 99)
     U = lab.universe(P, top_n=TOP_N)
     f7 = P["funding"].rolling(LOOKBACK).mean()
     C = P["close"]
     if BOOK == "funding":
         w = lab.drop_falling_longs(lab.xs_rank_weights(-f7, U, q=Q), C / C.shift(7) - 1, q=DROP_Q).iloc[-1]
+    elif BOOK == "boost":
+        with lock:
+            held = {s for s, q in kv("pos", {}).items() if q < 0}     # the short buffer's state = shorts held now
+        v30 = C.pct_change(fill_method=None).rolling(30, min_periods=20).std()
+        w = lab.boost_weights(f7, C / C.shift(7) - 1, v30, U, q=Q, held_short=held).iloc[-1]
     else:
         w = lab.crash_short_weights(P, U).iloc[-1]
     day = P["close"].index[-1]
@@ -209,8 +260,7 @@ def compute_signal(now_ms):
                          "rank_vol": fin(rank[s], 1, 0), "adv30_musd": fin(adv[s], 1e-6, 2), "close": fin(C[s].iloc[-1], 1, 10),
                          "atr14_pct": fin(atr[s], 100, 3), "vol30_pct": fin(vol30[s], 100, 2),
                          "ret1d_pct": fin(r1[s], 100, 3), "ret7d_pct": fin(r7[s], 100, 3)})
-    rows.sort(key=lambda r: r["f7_bps_day"])
-    filt = market_filter(now_ms)                                    # shadow only: logged, never gates trades
+    rows.sort(key=lambda r: r["f7_bps_day"])                         # filt: shadow only, logged, never gates trades
     return day, w[w != 0].to_dict(), rows, filt
 
 
@@ -285,7 +335,13 @@ def settle_funding(st, syms=None):
         if syms is not None and s not in syms:
             continue
         since = st["fund_from"].get(s, now_ms())
-        ev = get("/fapi/v1/fundingRate", symbol=s, startTime=since + 1, limit=1000)
+        c = SHARED["fund"].get(s)     # twin: the main book's download, if it covers `since` and is newer than the last settlement
+        if TWIN and c and c[1] <= since and c[0] >= LAST_SETTLE.get(s, 0) + 60_000 and now_ms() - c[0] < 600_000:
+            ev = [e for e in c[2] if int(e["fundingTime"]) > since]
+        else:
+            ev = get("/fapi/v1/fundingRate", symbol=s, startTime=since + 1, limit=1000)
+            if not TWIN:
+                SHARED["fund"][s] = (now_ms(), since, ev)
         for e in ev:
             t, rate, mark = int(e["fundingTime"]), float(e["fundingRate"]), float(e["markPrice"] or 0)
             if t > now_ms() or mark <= 0:
@@ -455,10 +511,13 @@ def loop():
             # fresh DB: never trade mid-day on a stale signal; the first rebalance is the next 00:05 UTC
             set_kv("last_day", last_closed_day())
         # everything needed to audit or move the run lives in the DB itself
-        set_kv("rule", {"lookback_days": LOOKBACK, "top_n": TOP_N, "book": BOOK, "quantile": Q, "drop_falling_longs_q": DROP_Q, "fee_bps": FEE_BPS, "fills": "buy at ask, sell at bid (bookTicker)",
-                        "start_equity": START_EQUITY, "candidates": "all USDT-M perps with underlyingType COIN",
-                        "atr_filter_shadow": {"off_below_pct": ATR_OFF_BELOW, "window_days": 365, "atr_n": 14},
-                        "trend_filter_shadow": {"off_above_pct": TREND_OFF_ABOVE, "sma": 200, "window_days": 365}})
+        rule = {"lookback_days": LOOKBACK, "top_n": TOP_N, "book": BOOK, "quantile": Q, "drop_falling_longs_q": DROP_Q, "fee_bps": FEE_BPS, "fills": "buy at ask, sell at bid (bookTicker)",
+                "start_equity": START_EQUITY, "candidates": "all USDT-M perps with underlyingType COIN",
+                "atr_filter_shadow": {"off_below_pct": ATR_OFF_BELOW, "window_days": 365, "atr_n": 14},
+                "trend_filter_shadow": {"off_above_pct": TREND_OFF_ABOVE, "sma": 200, "window_days": 365}}
+        if BOOK == "boost":
+            rule.update(BOOST_RULE)
+        set_kv("rule", rule)
         if not CON.execute("select 1 from signals limit 1").fetchone() and kv("signal"):
             CON.executemany("insert into signals values(?,?,?,?,?)",      # backfill the pre-table rebalance
                             [(kv("last_day"), r[0], x["sym"], x["f7_bps_day"], x["weight"])
@@ -479,13 +538,14 @@ def loop():
             if due and not busy and (utc.hour > 0 or utc.minute >= 5):
                 rebalance()
             # funding: one REST call per held symbol, only right after the websocket saw it settle
-            ready = {s for s, t in list(DUE.items()) if now_ms() - t > 60_000}
-            if ready or WS["sweep"]:
+            # (a twin waits 30 s longer, so the main book's download of the same record is there to reuse)
+            ready = {s for s, t in list(DUE.items()) if now_ms() - t > (90_000 if TWIN else 60_000)}
+            if ready or SWEEP["on"]:
                 with lock:
                     st = state()
-                    settle_funding(st, None if WS["sweep"] else ready)
+                    settle_funding(st, None if SWEEP["on"] else ready)
                     save(st); CON.commit()
-                WS["sweep"] = False
+                SWEEP["on"] = False
                 for s in ready:           # keep retrying each loop until Binance has published the record
                     if s not in st["pos"] or st["fund_from"].get(s, 0) >= DUE[s] - 1000 or now_ms() - DUE[s] > 3_600_000:
                         DUE.pop(s, None)
@@ -558,7 +618,8 @@ def api_state():
                 "feed": {"ws_age_s": round(time.time() - WS["ts"], 1) if WS["ts"] else None,
                          "ws_reconnects": WS["reconnects"], "rest_calls_1h": len(REST["calls"]),
                          "ip_weight_1m": REST["ip_weight_1m"]},
-                "rule": {"lookback_days": LOOKBACK, "top_n": TOP_N, "book": BOOK, "quantile": Q, "drop_falling_longs_q": DROP_Q, "fee_bps": FEE_BPS},
+                "rule": {"lookback_days": LOOKBACK, "top_n": TOP_N, "book": BOOK, "quantile": Q, "drop_falling_longs_q": DROP_Q, "fee_bps": FEE_BPS,
+                         **(BOOST_RULE if BOOK == "boost" else {})},
                 "filter_history": q("select day, btc_atr_pct, btc_trend_pct, atr_on, trend_on_shadow from filters order by ts desc limit 60"),
                 "working": q("select sym, qty, kind, status, limit_px, moves, created, spread0_bps from orders "
                              "where status not in ('filled_maker','filled_taker','skipped') order by created")}
@@ -566,13 +627,17 @@ def api_state():
 
 class H(BaseHTTPRequestHandler):
     def do_GET(self):
-        if self.path.startswith("/api/state"):
-            body, ctype = json.dumps(api_state()).encode(), "application/json"
-        elif self.path.startswith("/api/stats"):
-            body, ctype = json.dumps(api_stats(), default=float).encode(), "application/json"
-        elif self.path in ("/stats", "/stats.html"):
+        u = urllib.parse.urlsplit(self.path)
+        m = BOOKS.get(urllib.parse.parse_qs(u.query).get("book", [BOOK])[0])     # ?book=boost -> that tab's book
+        if m is None:
+            self.send_error(404); return
+        if u.path == "/api/state":
+            body, ctype = json.dumps({**m.api_state(), "books": list(BOOKS)}).encode(), "application/json"
+        elif u.path == "/api/stats":
+            body, ctype = json.dumps(m.api_stats(), default=float).encode(), "application/json"
+        elif u.path in ("/stats", "/stats.html"):
             body, ctype = (HERE / "stats.html").read_bytes(), "text/html; charset=utf-8"
-        elif self.path in ("/", "/index.html"):
+        elif u.path in ("/", "/index.html"):
             body, ctype = (HERE / "fronttest.html").read_bytes(), "text/html; charset=utf-8"
         else:
             self.send_error(404); return
@@ -677,11 +742,53 @@ def selfcheck():
     assert abs(imp - 1e4 * (10.01 / 10.0 - 1)) < 1e-9                                # half spread = 10 bps here
     cash = START_EQUITY - st["pos"]["A"] * 10.01 - fa[1] - st["pos"]["B"] * 20.1 - fb[1]
     assert abs(st["cash"] - cash) < 1e-9
+    # parallel book: own DB and state, same feed; reuses the main book's downloads and never requests them itself
+    tw = load_twin("boost")
+    def no_rest(path, **k):
+        raise AssertionError(f"twin requested {path}")
+    tw.get = no_rest
+    assert tw.PX is PX and tw.SHARED is SHARED and tw.DUE is not DUE and tw.CON is not CON and tw.DB != DB
+    assert tw.state()["pos"] == {} and tw.kv("rule") is None
+    on_mark([{"s": "B", "p": "23", "T": 3000}]); assert tw.DUE["B"] == 2000 == DUE["B"]      # settlement reaches both
+    SHARED["book"] = (time.time(), {"A": (9.0, 11.0)}); assert tw.book_prices() == {"A": (9.0, 11.0)}
+    SHARED["depth"]["A"] = (time.time(), {"asks": [["11", "100"]], "bids": [["9", "100"]]})
+    assert tw.depth_fill("A", 2.0, 9.0, 11.0) == (11.0, 1)
+    ev = [{"fundingTime": 1500, "fundingRate": "0.001", "markPrice": "20"}, {"fundingTime": 2000, "fundingRate": "0.002", "markPrice": "20"}]
+    SHARED["fund"]["B"] = (now_ms(), 0, ev)
+    tst = {"cash": 0.0, "pos": {"B": -1.0}, "entry": {}, "fund_from": {"B": 1500}, "opened": {}}
+    tw.settle_funding(tst)                                               # only the event after its own fund_from
+    assert abs(tst["cash"] - 1.0 * 20 * 0.002) < 1e-12 and tst["fund_from"]["B"] == 2000
+    assert tw.CON.execute("select count(*) from funding").fetchone()[0] == 1
     print("fronttest selfcheck ok")
 
 
+def check_book():
+    old = kv("rule")
+    if old and old.get("book", "funding") != BOOK:            # never run one book's rule on the other book's DB
+        raise SystemExit(f"{DB} holds the {old.get('book', 'funding')!r} book, FRONTTEST_BOOK is {BOOK!r}")
+
+
+def load_twin(book):
+    """A parallel book in this process: a fresh copy of this module (own DB next to ours, state, lock, executor)
+    whose feed and caches are this module's objects, so nothing is downloaded twice."""
+    env = dict(os.environ)
+    os.environ.update(FRONTTEST_BOOK=book, FRONTTEST_DB=str(DB.with_name(f"{DB.stem}_{book}.db")))
+    try:
+        spec = importlib.util.spec_from_file_location(f"fronttest_{book}", __file__)
+        m = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(m)
+    finally:
+        os.environ.clear(); os.environ.update(env)
+    for k in ("PX", "NEXT_T", "IDX", "RATE", "WS", "REST", "LAST_SETTLE", "SHARED", "PANEL_LOCK"):
+        setattr(m, k, globals()[k])
+    m.TWIN = True
+    m.check_book()
+    TWINS.append(m)
+    BOOKS[book] = m
+    return m
+
+
 if __name__ == "__main__":
-    import sys
     if "--selfcheck" in sys.argv:
         selfcheck(); raise SystemExit
     if "--backup" in sys.argv:                         # consistent copy even while the fronttest is running
@@ -689,10 +796,12 @@ if __name__ == "__main__":
         with sqlite3.connect(dst) as out:
             CON.backup(out)
         print("backed up to", dst); raise SystemExit
-    old = kv("rule")
-    if old and old.get("book", "funding") != BOOK:            # never run one book's rule on the other book's DB
-        raise SystemExit(f"{DB} holds the {old.get('book', 'funding')!r} book, FRONTTEST_BOOK is {BOOK!r}")
+    check_book()
+    BOOKS[BOOK] = sys.modules[__name__]
+    for b in [x for x in os.environ.get("FRONTTEST_EXTRA", "boost" if BOOK == "funding" else "").split(",") if x]:
+        load_twin(b)
     threading.Thread(target=ws_loop, daemon=True).start()
-    threading.Thread(target=loop, daemon=True).start()
-    print(f"fronttest UI on http://{HOST}:{PORT}  db={DB}", flush=True)
+    for m in BOOKS.values():
+        threading.Thread(target=m.loop, daemon=True).start()
+    print(f"fronttest UI on http://{HOST}:{PORT}  books: " + ", ".join(f"{b} db={m.DB}" for b, m in BOOKS.items()), flush=True)
     ThreadingHTTPServer((HOST, PORT), H).serve_forever()

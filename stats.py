@@ -15,7 +15,9 @@ BACKTEST = {  # funding: ret7_test.py (top-100 + lab.drop_falling_longs); crash:
     "funding": {"sharpe": 1.27, "ann_return_pct": 43.5, "daily_mean_pct": 0.119, "daily_std_pct": 1.80,
                 "worst_day_pct": -9.2, "max_dd_pct": -28.3, "price_pct_yr": -11.0, "funding_pct_yr": 62.7, "cost_pct_yr": 8.2},
     "crash": {"sharpe": 1.32, "ann_return_pct": 21.5, "daily_mean_pct": 0.059, "daily_std_pct": 0.85,
-              "worst_day_pct": -8.4, "max_dd_pct": -15.2, "price_pct_yr": 22.9, "funding_pct_yr": -0.1, "cost_pct_yr": 1.4}}
+              "worst_day_pct": -8.4, "max_dd_pct": -15.2, "price_pct_yr": 22.9, "funding_pct_yr": -0.1, "cost_pct_yr": 1.4},
+    "boost": {"sharpe": 2.33, "ann_return_pct": 32.5, "daily_mean_pct": 0.089, "daily_std_pct": 0.73,   # boost.py NEW rule
+              "worst_day_pct": -3.0, "max_dd_pct": -15.4, "price_pct_yr": 15.8, "funding_pct_yr": 23.6, "cost_pct_yr": 6.8}}
 EPS = 1e-12
 
 

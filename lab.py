@@ -139,6 +139,31 @@ def drop_falling_longs(w, ret7, q=0.2):
     return 0.5 * lo.div(lo.sum(axis=1).replace(0, np.nan), axis=0).fillna(0) + w.clip(upper=0)
 
 
+GOLD = ("PAXGUSDT", "XAUTUSDT")
+
+
+def boost_weights(F7, ret7, vol30, U, q=1 / 3, stay=0.5, cap=0.05, held_short=None):
+    """boost.py NEW book: long the lowest-q / short the highest-q 7d funding (gold tokens out), drop falling longs;
+    a short stays while it is in the highest `stay` share; both legs weighted by 1/vol30, max `cap` per coin, 0.5 each.
+    The short buffer is path dependent: held_short (symbols short now) replaces the path state on the last row (live)."""
+    m = U.copy()
+    m[[g for g in GOLD if g in m.columns]] = False
+    enter = drop_falling_longs(xs_rank_weights(-F7, m, q), ret7)
+    e, x = (enter < 0).values, (xs_rank_weights(-F7, m, stay) < 0).values
+    cur, out = np.zeros(e.shape[1], bool), np.zeros(e.shape, bool)
+    for i in range(len(e)):
+        if held_short is not None and i == len(e) - 1:
+            cur = np.isin(np.asarray(F7.columns), list(held_short))
+        cur = (cur & x[i]) | e[i]
+        out[i] = cur
+    norm = lambda a: 0.5 * a.div(a.sum(axis=1).replace(0, np.nan), axis=0).fillna(0.0)
+    iv = 1 / vol30
+    lo, sh = norm((enter > 0) * iv), norm(pd.DataFrame(out, index=F7.index, columns=F7.columns) * iv)
+    for _ in range(5):
+        lo, sh = norm(lo.clip(upper=cap)), norm(sh.clip(upper=cap))
+    return lo - sh
+
+
 def crash_short_weights(P, U, z_lo=-4.2, z_hi=-2.2, hold=21, far_sig=3.3, cap=0.05, vol_spike=2.0):
     """crash_short.py book: short every coin that fell z_lo..z_hi sigma (30d vol before the day) in one day while more than
     far_sig sigma below its 365d high, for `hold` days, equal weight, max `cap` per coin (rest in cash);
@@ -256,4 +281,11 @@ if __name__ == "__main__":
     assert abs(cw["A"].iloc[350] - (0.05 / 10 - 0.05)) < 1e-12 and abs(cw["A"].iloc[370] - cw["A"].iloc[350]) < 1e-12
     assert cw["A"].iloc[371] == 0 and cw.iloc[349].abs().sum() == 0, "held exactly 21 days, nothing before the event"
     assert abs(cw.sum(axis=1)).max() < 1e-12, "dollar neutral"
+    # boost book: 30 coins, funding rank = column order; a held short stays while in the top half, cap 5%, legs 0.5
+    cols = [f"C{i}" for i in range(29)] + ["PAXGUSDT"]
+    f7 = pd.DataFrame([np.arange(30.0)] * 2, columns=cols)
+    one = f7 * 0 + 1.0
+    bw = boost_weights(f7, one, one * 0.02, one > 0, held_short={"C15"}).iloc[-1]
+    assert bw["PAXGUSDT"] == 0 and bw["C15"] < 0 and bw["C14"] == 0, "gold out, held short stays in the top half only"
+    assert abs(bw.clip(lower=0).sum() - 0.5) < 1e-12 and abs(bw.clip(upper=0).sum() + 0.5) < 1e-12 and bw.abs().max() <= 0.05 + 1e-12
     print("lab selfcheck ok")

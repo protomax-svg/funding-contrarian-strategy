@@ -26,6 +26,7 @@ from collections import defaultdict
 
 API = "https://fapi.binance.com"
 CRASH = False                # set in main() from the DB's rule: which book this DB trades
+BOOST = False                # boost book (lab.boost_weights): inverse-vol sizes, max 5% per coin
 DAY = 86_400_000
 
 
@@ -67,8 +68,9 @@ def main(db):
     fund = con.execute("select ts, sym, rate, mark, payment from funding order by ts").fetchall()
     reb = con.execute("select ts, day from rebalances order by ts").fetchall()
     start_eq = kv.get("rule", {}).get("start_equity", 1000.0)
-    global CRASH
+    global CRASH, BOOST
     CRASH = kv.get("rule", {}).get("book", "funding") == "crash"
+    BOOST = kv.get("rule", {}).get("book", "funding") == "boost"
     ok = True
     print(f"DB {db}: {len(trades)} trades, {len(fund)} funding rows, {len(reb)} rebalances\n")
 
@@ -183,8 +185,13 @@ def main(db):
                      f"{len(probe)} biggest shorts: {ev_ok}, net {sum(r[2] for r in L + S):+.4f}")
         else:
             rule_ok = bool(sig) and (not L or not S or max(r[1] for r in L) <= min(r[1] for r in S))
-            sizes = {round(abs(r[2]), 6) for r in L + S}
-            line += f"long f7 <= short f7: {rule_ok}, equal size: {len(sizes) <= 2}, net {sum(r[2] for r in L + S):+.4f}"
+            if BOOST:
+                cap_ok = all(abs(r[2]) <= 0.05 + 1e-9 for r in L + S)
+                line += f"long f7 <= short f7: {rule_ok}, max 5% per coin: {cap_ok}, net {sum(r[2] for r in L + S):+.4f}"
+                rule_ok &= cap_ok
+            else:
+                sizes = {round(abs(r[2]), 6) for r in L + S}
+                line += f"long f7 <= short f7: {rule_ok}, equal size: {len(sizes) <= 2}, net {sum(r[2] for r in L + S):+.4f}"
         ok &= 0 < lag_h < 24 and rule_ok and neutral
         # since 2026-09-28 the worst-7d-return longs are dropped: every low-funding coin left out must have fallen
         # more than every long kept (features.ret7d_pct is computed from the saved closes checked below)

@@ -34,7 +34,7 @@ input{background:var(--card);color:var(--ink);border:1px solid var(--line);borde
 </head>
 <body>
 <main>
-  <nav><a href="/">← Live dashboard</a><a href="/stats">Statistics</a></nav>
+  <nav><a id="back" href="/">← Live dashboard</a><a id="self" href="/stats">Statistics</a></nav>
   <h1>Fronttest statistics</h1>
   <p class="sub" id="sub">loading…</p>
 
@@ -144,8 +144,12 @@ function bars(daily){
       return `<rect x="${x}" y="${d.pnl >= 0 ? y0 - h : y0}" width="${bw}" height="${Math.max(h,1)}" fill="${d.pnl >= 0 ? "var(--pos)" : "var(--neg)"}"><title>${d.day}: ${usd(d.pnl)}</title></rect>`; }).join("");
 }
 
+const BOOK = new URLSearchParams(location.search).get("book") || "";
+const Q = BOOK ? "?book=" + encodeURIComponent(BOOK) : "";
+$("back").href = "/" + Q; $("self").href = "/stats" + Q;
+if (BOOK) document.querySelector("h1").textContent = `Fronttest statistics — ${BOOK === "boost" ? "Funding NEW (boost)" : BOOK}`;
 async function refresh(){
-  try { S = await (await fetch("/api/stats")).json(); } catch(e){ $("sub").textContent = "backend not reachable"; return; }
+  try { S = await (await fetch("/api/stats" + Q)).json(); } catch(e){ $("sub").textContent = "backend not reachable"; return; }
   const T = S.totals, D = S.daily_summary || {}, B = S.backtest;
   $("sub").textContent = `Started ${t(S.started)} UTC · ${S.coins.length} coins traded · ${S.episodes.length} round trips · refreshes every 60 s`;
   const k = [["Equity", usd(S.equity), ""], ["Net P&L", usd(T.net), sgn(T.net)], ["Price P&L", usd(T.price_pnl), sgn(T.price_pnl)],

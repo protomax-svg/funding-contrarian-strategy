@@ -125,6 +125,15 @@ paper book with its own DB and port: `deploy/fronttest-crash.service` (`fronttes
 funding, stats page and audit; the audit re-derives the sharp-drop event of the 3 biggest shorts from raw klines.
 A DB refuses to start with the other book's rule. Live check on 2026-09-27 (before the volume filter): 14 shorts, all 14 events re-derived.
 
+## Parallel book: Funding NEW (boost), since 2026-09-28
+
+The funding process now also runs the `boost.py` NEW rule (`lab.boost_weights`) as a second paper book, in the same
+process and UI: tab "Funding NEW (boost)" (`/?book=boost`, stats `/stats?book=boost`). The live funding book's rule, DB and
+fills do not change. The NEW book has its own DB (`fronttest_boost.db`, next to `FRONTTEST_DB`), state, $1,000 and executor.
+It downloads nothing again: it uses the same websocket feed, the same daily panel (built once per day by whichever book asks
+first), and the live book's book ticker, order books (< 30 s old) and funding records (it settles 30 s after the live book).
+`FRONTTEST_EXTRA=""` turns it off. Audit: `python audit.py fronttest_boost.db`. A fresh NEW book waits for the next 00:05 UTC.
+
 ## Crash book: filters, exits, sizing, hedges (`crash_lab.py` → `results_crash_lab.md`)
 
 22 one-change variants, fixed before running. Sharpe:
@@ -171,6 +180,30 @@ Rules fixed before running. Sources for #20/#21: `reddit_ideas_raw2.md`.
 | #20 tiered drawdown buying vs DCA (r/Bitcoin 1w81qb9) | **FAIL** | Same $10/week: beats DCA in 38-75% of start dates, median no better; whole period DCA 2.75x vs 2.56x. |
 | #21 day-of-week (r/BitcoinMarkets) | Weak | Post's Wed-up/Fri-down: z < 1. IS-best 3 days OOS 0.92 vs hold 0.72, but rank 5/35 of all 3-day sets (p ≈ 0.14). |
 
+## Round 3, 2026-09-28: make the funding book more profitable (`boost.py` → `results_boost.md`)
+
+~60 one-change variants on the live rule (signal, short/long filters, weights, hedges, turnover, universe, sizing),
+plus a 16-cell combination grid. Idea list partly from a literature search (BIS "Crypto Carry", carry/vol, squeeze screens).
+
+**Where the money is (OOS, per year, legs 0.5 each):** long leg price −25 %, long leg funding +53 %; short leg price +14 %,
+short leg funding +10 %. The price loss is on the **long** leg: deeply negative-funding coins (most on 1h/4h funding) keep falling.
+
+| | IS | OOS | 15 bps | +1 day | OOS %/yr | Max DD | vol/yr | worst day |
+|---|---|---|---|---|---|---|---|---|
+| live rule | 2.31 | 1.27 | 1.00 | 0.75 | 43 | −28% | 27% | −9.2% |
+| **NEW** (terciles + short buffer + inverse-vol + 5% cap, no gold) | **2.38** | **2.33** | **1.77** | **2.03** | 33 | **−15%** | **14%** | −3.5% |
+| **NEW at 2x gross** (≈ same risk as live) | 2.38 | 2.33 | 1.77 | 2.03 | **65** | −29% | 27% | −7% |
+| 50/50 NEW + crash book (corr 0.02) | 2.88 | 2.61 | | | 28 | −10% | 9% | |
+
+- NEW = q 0.33 (not 0.2), shorts stay while in the top half, both legs weighted by 1/30d vol, max 5% per coin, PAXG/XAUT out.
+  Long leg price loss −25 % → −3 %/yr. Funding earned drops, but volatility halves, so at 2x gross it earns ~1.5x the live return.
+- Robust: q 0.25-0.40 all OOS ≥ 1.9; vol lookback 10-90d OOS 2.05-2.41; better than live on top-30/50/150;
+  random-weight placebo OOS max 1.87 vs 2.42; vol-matched gain P(≤0) 0.11 IS, 0.03 OOS; 2024/25/26 each better per unit risk.
+- Weak spots: IS Sharpe is not better (gain shows only after 2024, when the long-leg funding harvest started); 2023 −5 %;
+  ~69 positions (min order size at small equity); 2x gross needs margin checks on squeezes.
+- Failed: other signals (1d/3d/14d, last rate, premium, carry/vol), carry weighting (DD −78%), BTC/market hedge, top-150/200, vol targeting,
+  most squeeze filters. IS-best single variants usually failed OOS (regime change around 2024).
+
 ## Files
 
 | File | What |
@@ -185,6 +218,7 @@ Rules fixed before running. Sources for #20/#21: `reddit_ideas_raw2.md`.
 | `regime.py` → `results_regime.md` | Market-state filters, ATR, vol targeting, walk-forward. |
 | `dip52.py` → `results_dip52.md` | #19 dip near 52w high, event study + nearness factor. |
 | `crash_short.py` → `results_crash_short.md` | #19 lead: short sharp-drop coins, EW-hedged, 5% cap. |
+| `boost.py` → `results_boost.md` | Round 3: ~60 ways to make the funding book more profitable, NEW rule (`boost.new_rule`). |
 | `jev_pilot.py` → `results_jev.txt`, `jev_pilot.jsonl` | Jev pilot (needs `JEV_API_KEY` in `.env`). |
 
 ## Setup
