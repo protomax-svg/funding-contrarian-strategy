@@ -402,3 +402,17 @@ standalone, frequently-tradeable signal).
   crypto-perp/spot trading rules per se (a market-structure finding, an academic obstacles-paper, and
   a prediction-market execution post respectively) — worth knowing about but didn't fit the "concrete
   tradeable rule" bar as cleanly as the 18 above.
+
+---
+
+## 19. Buy the dip near the 52-week high (harvested 2026-09-27)
+**Source:** https://www.reddit.com/r/algotrading/comments/1tzicir/ (2026-06) + follow-up https://www.reddit.com/r/algotrading/comments/1ty1rch/
+**Rule:** QQQ daily, 25 y. A one-day drop of -3.3%..-6.3% while within 5% of the 52w high ("near", N=20) vs the same
+drop >5% below the high ("far", N=164). Near: +4.7% after 3 months, 80% positive, max further drawdown -8.4% vs -16.7%.
+**Pushback:** tiny sample (N=15-20); sample is mostly bull-market; "run it with a trend filter"; gap-down fills.
+**Data for crypto test:** daily OHLC, free. **Testability 5/5. Plausibility 3/5** (related to the George-Hwang 52w-high anomaly).
+
+Other posts read in this pass and skipped: 1witlif (liquidation heat-map, needs paid data, = #10), 1ss5btv (15x BTC
+signal, rules not disclosed), 1rjvxjy (HH10 - 2.5xATR + IBS<0.3 = #12), 1sd9hlj (BTC/ETH correlation gate, base rule
+not disclosed), 1tkrfiz (EWMA per-direction kill switch, a filter), 1wlf3mk (blow-off score filter, equities),
+1puch9n (top-3 coins, no rule given).
