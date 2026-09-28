@@ -101,6 +101,50 @@ high-funding coins (spread out: top-5 coins = 12% of the funding, 10 best days =
 ~41 positions on average, so with $1,000 each is ~$25 (fine for paper; check Binance minimum order sizes before real money).
 Live and backtest pick identical books on 2026-08-20 and 2026-08-30 (41/41).
 
+## Drop falling longs (`ret7_test.py` → `results_ret7.md`) — live since 2026-09-28
+
+Rule on top of the top-100 book (`lab.drop_falling_longs`): no long in the worst 20% of the long leg by 7-day return;
+the rest of the long leg is re-weighted to 0.5. Shorts are unchanged.
+
+| | 2020-23 | 2024-26 | 15 bps | +1 day | Max DD |
+|---|---|---|---|---|---|
+| top-100 plain | 2.12 | 1.10 | 0.87 | 0.46 | −27% |
+| **top-100 + drop falling longs** | **2.31** | **1.27** | **1.00** | **0.75** | −28% |
+
+Also better on top-30 and top-50; all 28 lookback × cutoff cells OOS 1.01-1.57; random-drop placebo p = 0.005;
+6-month walk-forward 1.20 vs 1.10; block bootstrap P(no gain) 7-9 %. OOS price −21 → −11 %/yr, funding unchanged,
+costs +2 %/yr, daily vol 1.37 → 1.80 %. Found after looking at 2024-26, so treat the OOS gain as optimistic.
+Banning coins that were bad in past years does nothing (coin P&L year-to-year rank corr ≈ 0).
+
+## Idea #19: buy the dip near the 52-week high (`dip52.py` → `results_dip52.md`, `crash_short.py` → `results_crash_short.md`)
+
+Source: r/algotrading 1tzicir (QQQ: a sharp one-day drop near the 52w high recovers, +4.7% in 3 months, N=20).
+Crypto version: drops and distances in units of each coin's 30d vol, all perps, top-100.
+
+| Test | Verdict | Key numbers |
+|---|---|---|
+| Dip near the high, as posted | **FAIL** | Too rare in crypto (BTC: 3 events in 6.7 y; top-100: 26). No better than dips far from the high. |
+| Buy every sharp dip (far from high) | **FAIL, inverted** | These coins keep losing vs the market: 21d t = −1.6 IS, −3.7 OOS. |
+| Nearness-to-365d-high factor (long nearest, short farthest) | Weak | OOS 0.59, alpha t 2.3, but placebo p = 0.30 and half of it is momentum (corr 0.41). |
+| **Lead: short sharp-drop coins, hedge with EW long, max 5% per coin** | **Promising, not proven** | Post-like rule (−2.2..−4.2σ, far from high, 21d): IS 0.67, OOS 1.49, 15 bps 1.31, +1d 1.87, placebo p 0.00, alpha t 2.6, DD −25%. Walk-forward over 24 rules: OOS 1.45. **But** the IS-best rule gives only OOS 0.29, and the lead was found by looking at OOS. |
+
+Blend 50% with the live funding strategy (corr −0.03): OOS 1.76 vs 1.10, max DD −14% vs −27% (post-like rule; IS-best rule: OOS 1.09).
+Without the 5% cap one coin could be the whole short leg (PIPPIN 2025-10, LAB 2026-07 squeezes: DD −56% to −80%).
+Next step: run it as a shadow book in the fronttest before any money.
+
+## Round 2, 2026-09-27: own crypto ideas + 2 more Reddit ideas (`own_ideas.py` → `results_own.md`, `reddit2.py` → `results_reddit2.md`)
+
+Rules fixed before running. Sources for #20/#21: `reddit_ideas_raw2.md`.
+
+| Idea | Verdict | Key numbers |
+|---|---|---|
+| H1 short new listings (age 3-60d, 5% cap, EW hedge) | **FAIL** | IS 0.84 → OOS −0.10; 2025 −50%. |
+| H2 short volume spikes (attention reversal) | **FAIL** | IS 0.36, OOS −0.76. |
+| H3 dip before high-funding settlement (1h) | **FAIL, inverted** | Price rises into the settlement; short loses 11 bps IS / 5 bps OOS per trade. |
+| H4 betting-against-beta vs BTC | **FAIL** | OOS 0.77 but from 2 years (2021 +247%, 2026 +189%); placebo p 0.08. |
+| #20 tiered drawdown buying vs DCA (r/Bitcoin 1w81qb9) | **FAIL** | Same $10/week: beats DCA in 38-75% of start dates, median no better; whole period DCA 2.75x vs 2.56x. |
+| #21 day-of-week (r/BitcoinMarkets) | Weak | Post's Wed-up/Fri-down: z < 1. IS-best 3 days OOS 0.92 vs hold 0.72, but rank 5/35 of all 3-day sets (p ≈ 0.14). |
+
 ## Files
 
 | File | What |
@@ -113,6 +157,8 @@ Live and backtest pick identical books on 2026-08-20 and 2026-08-30 (41/41).
 | `funding_deep.py` → `results_funding.md` | Deep-dive on the gem. |
 | `pairs_test.py` → `results_pairs.md` | Same signal with group-matched long/short pairs. |
 | `regime.py` → `results_regime.md` | Market-state filters, ATR, vol targeting, walk-forward. |
+| `dip52.py` → `results_dip52.md` | #19 dip near 52w high, event study + nearness factor. |
+| `crash_short.py` → `results_crash_short.md` | #19 lead: short sharp-drop coins, EW-hedged, 5% cap. |
 | `jev_pilot.py` → `results_jev.txt`, `jev_pilot.jsonl` | Jev pilot (needs `JEV_API_KEY` in `.env`). |
 
 ## Setup

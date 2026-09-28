@@ -131,6 +131,14 @@ def xs_rank_weights(score, mask, q=0.2, long_only=False):
     return wl if long_only else 0.5 * wl - 0.5 * ws
 
 
+def drop_falling_longs(w, ret7, q=0.2):
+    """Drop the longs whose 7d return is in the bottom q of the long leg; re-weight the long leg to 0.5.
+    Falling low-funding coins keep falling (ret7_test.py: OOS Sharpe 1.10 -> 1.27, placebo p 0.005)."""
+    drop = (ret7.where(w > 0).rank(axis=1, pct=True) <= q) & (w > 0)
+    lo = w.clip(lower=0).where(~drop, 0.0)
+    return 0.5 * lo.div(lo.sum(axis=1).replace(0, np.nan), axis=0).fillna(0) + w.clip(upper=0)
+
+
 # ---------- indicators (Wilder smoothing where the original uses it) ----------
 def ema(x, n):
     return x.ewm(span=n, adjust=False, min_periods=n).mean()
@@ -208,4 +216,9 @@ if __name__ == "__main__":
     assert sharpe(backtest(cheat, P, 0)["net"], 365) > 10, "future-peek must look amazing"
     assert abs(sharpe(backtest(honest, P, 0)["net"], 365)) < 1.5, "no edge on iid noise"
     assert backtest(honest, P, 10)["net"].sum() < backtest(honest, P, 0)["net"].sum(), "costs must bite"
+    w = pd.DataFrame([[0.1] * 5 + [-0.1] * 5], columns=list("ABCDEFGHIJ"))
+    r7 = pd.DataFrame([[-0.5, 0.1, 0.2, 0.3, 0.4] + [-0.9] * 5], columns=w.columns)
+    d = drop_falling_longs(w, r7).iloc[0]
+    assert d["A"] == 0 and abs(d[list("BCDE")] - 0.125).max() < 1e-12, "worst 20% of longs out, rest re-weighted"
+    assert (d[list("FGHIJ")] == -0.1).all() and abs(d.sum()) < 1e-12, "shorts untouched, still neutral"
     print("lab selfcheck ok")

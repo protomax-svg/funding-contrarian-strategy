@@ -151,6 +151,15 @@ def main(db):
                 f"{'OK' if 0 < lag_h < 24 else 'BAD'} | 5 RULE {len(sig)} coins, {len(L)} long / {len(S)} short, "
                 f"long f7 <= short f7: {rule_ok}, equal size: {len(sizes) <= 2}, net {sum(r[2] for r in L + S):+.4f}")
         ok &= 0 < lag_h < 24 and rule_ok and neutral
+        # since 2026-09-28 the worst-7d-return longs are dropped: every low-funding coin left out must have fallen
+        # more than every long kept (features.ret7d_pct is computed from the saved closes checked below)
+        if has_feat and L:
+            r7 = {s: v for s, v in con.execute("select sym, ret7d_pct from features where ts=?", (ts,)) if v is not None}
+            maxf = max(r[1] for r in L)
+            dropped = [r[0] for r in sig if r[2] == 0 and r[1] < maxf]
+            drop_ok = not dropped or max(r7.get(s, -1e9) for s in dropped) <= min(r7.get(r[0], 1e9) for r in L)
+            line += f" | dropped falling longs: {len(dropped)}, all fell more than kept longs: {drop_ok}"
+            ok &= drop_ok
         # positions once this rebalance's orders are done (= just before the next rebalance, or now) must equal the
         # signal, minus entries the executor skipped (wide spread, too little funding); still-working orders are pending
         nxt = next((r[0] for r in reb if r[0] > ts), None)

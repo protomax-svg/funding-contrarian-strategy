@@ -1,12 +1,13 @@
 """Paper-trading fronttest of the funding-contrarian strategy (#7b), exactly as backtested.
 
-Rule (alltest.py "top-100 base"): daily at the UTC close, among ALL Binance USDT-M crypto perps
+Rule (alltest.py "top-100 base" + ret7_test.py): daily at the UTC close, among ALL Binance USDT-M crypto perps
 (underlyingType COIN, status TRADING), take the top-100 by 30d average quote volume (>= 60 days listed);
-long the 20% with the lowest 7-day funding, short the 20% with the highest; half the equity long, half short,
-equal weight. A coin that leaves the top-100 is closed at the next rebalance. 7 bps/side on every change;
+long the 20% with the lowest 7-day funding, short the 20% with the highest, then drop the longs whose 7d return
+is in the worst 20% of the long leg (lab.drop_falling_longs, since 2026-09-28); half the equity long, half short,
+equal weight inside each side. A coin that leaves the top-100 is closed at the next rebalance. 7 bps/side on every change;
 real funding paid/received at every settlement. BTC ATR and trend filters are logged in shadow mode only.
 
-Signal logic is lab.universe + lab.xs_rank_weights on a live-built panel, so it cannot drift
+Signal logic is lab.universe + lab.xs_rank_weights + lab.drop_falling_longs on a live-built panel, so it cannot drift
 from the backtest. Run:  python fronttest.py   -> http://127.0.0.1:8770   (env: FRONTTEST_DB, FRONTTEST_HOST, FRONTTEST_PORT)
 """
 import json
@@ -38,6 +39,7 @@ FEE_BPS = 5.0                # Binance USDT-M taker fee; the spread is paid for 
 SNAP_S = 60                  # equity row in the DB every minute (prices themselves are live, every 3 s)
 MARK_S = 900                 # mark of every held coin every 15 min -> worst/best move per trade (stats page)
 LOOKBACK, TOP_N, Q = 7, 100, 0.2
+DROP_Q = 0.2                 # since 2026-09-28: no long in the worst 20% of the long leg by 7d return (ret7_test.py)
 ATR_OFF_BELOW = 1 / 3        # SHADOW: BTC ATR% in the low third of its last year (hurt on the full universe, alltest.py)
 TREND_OFF_ABOVE = 2 / 3      # SHADOW: logged only; BTC close/SMA200 in the top third of its last year
 API = "https://fapi.binance.com"
@@ -182,10 +184,10 @@ def compute_signal(now_ms):
     P = build_panel(tradable_symbols(), now_ms)
     U = lab.universe(P, top_n=TOP_N)
     f7 = P["funding"].rolling(LOOKBACK).mean()
-    w = lab.xs_rank_weights(-f7, U, q=Q).iloc[-1]
+    C = P["close"]
+    w = lab.drop_falling_longs(lab.xs_rank_weights(-f7, U, q=Q), C / C.shift(7) - 1, q=DROP_Q).iloc[-1]
     day = P["close"].index[-1]
     # market state of every top-N coin at this close, for the stats page (all from the klines already fetched)
-    C = P["close"]
     atr = lab.atr_pct(P["high"], P["low"], C).iloc[-1]
     vol30 = C.pct_change(fill_method=None).rolling(30, min_periods=15).std().iloc[-1] * np.sqrt(365)
     adv = P["qv"].rolling(30, min_periods=15).mean().iloc[-1]
@@ -445,7 +447,7 @@ def loop():
             # fresh DB: never trade mid-day on a stale signal; the first rebalance is the next 00:05 UTC
             set_kv("last_day", last_closed_day())
         # everything needed to audit or move the run lives in the DB itself
-        set_kv("rule", {"lookback_days": LOOKBACK, "top_n": TOP_N, "quantile": Q, "fee_bps": FEE_BPS, "fills": "buy at ask, sell at bid (bookTicker)",
+        set_kv("rule", {"lookback_days": LOOKBACK, "top_n": TOP_N, "quantile": Q, "drop_falling_longs_q": DROP_Q, "fee_bps": FEE_BPS, "fills": "buy at ask, sell at bid (bookTicker)",
                         "start_equity": START_EQUITY, "candidates": "all USDT-M perps with underlyingType COIN",
                         "atr_filter_shadow": {"off_below_pct": ATR_OFF_BELOW, "window_days": 365, "atr_n": 14},
                         "trend_filter_shadow": {"off_above_pct": TREND_OFF_ABOVE, "sma": 200, "window_days": 365}})
@@ -548,7 +550,7 @@ def api_state():
                 "feed": {"ws_age_s": round(time.time() - WS["ts"], 1) if WS["ts"] else None,
                          "ws_reconnects": WS["reconnects"], "rest_calls_1h": len(REST["calls"]),
                          "ip_weight_1m": REST["ip_weight_1m"]},
-                "rule": {"lookback_days": LOOKBACK, "top_n": TOP_N, "quantile": Q, "fee_bps": FEE_BPS},
+                "rule": {"lookback_days": LOOKBACK, "top_n": TOP_N, "quantile": Q, "drop_falling_longs_q": DROP_Q, "fee_bps": FEE_BPS},
                 "filter_history": q("select day, btc_atr_pct, btc_trend_pct, atr_on, trend_on_shadow from filters order by ts desc limit 60"),
                 "working": q("select sym, qty, kind, status, limit_px, moves, created, spread0_bps from orders "
                              "where status not in ('filled_maker','filled_taker','skipped') order by created")}

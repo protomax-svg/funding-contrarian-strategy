@@ -10,9 +10,9 @@ import math
 import numpy as np
 import pandas as pd
 
-# backtest reference for the live rule (alltest.py / leverage_test.py, top-100 plain, 2024-01..2026-08, 1x)
-BACKTEST = {"sharpe": 1.10, "ann_return_pct": 35.0, "daily_mean_pct": 0.083, "daily_std_pct": 1.37,
-            "worst_day_pct": -9.3, "max_dd_pct": -27.0, "price_pct_yr": -21.4, "funding_pct_yr": 63.0, "cost_pct_yr": 6.3}
+# backtest reference for the live rule (ret7_test.py: top-100 + lab.drop_falling_longs, 2024-01..2026-08, 1x)
+BACKTEST = {"sharpe": 1.27, "ann_return_pct": 43.5, "daily_mean_pct": 0.119, "daily_std_pct": 1.80,
+            "worst_day_pct": -9.2, "max_dd_pct": -28.3, "price_pct_yr": -11.0, "funding_pct_yr": 62.7, "cost_pct_yr": 8.2}
 EPS = 1e-12
 
 
