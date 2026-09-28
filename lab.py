@@ -139,6 +139,26 @@ def drop_falling_longs(w, ret7, q=0.2):
     return 0.5 * lo.div(lo.sum(axis=1).replace(0, np.nan), axis=0).fillna(0) + w.clip(upper=0)
 
 
+def crash_short_weights(P, U, z_lo=-4.2, z_hi=-2.2, hold=21, far_sig=3.3, cap=0.05, vol_spike=2.0):
+    """crash_short.py book: short every coin that fell z_lo..z_hi sigma (30d vol before the day) in one day while more than
+    far_sig sigma below its 365d high, for `hold` days, equal weight, max `cap` per coin (rest in cash);
+    hedged with the same notional long in the equal-weight top-N (U). Known at close t.
+    vol_spike: only drops on a day with quote volume > vol_spike x its 30d average (crash_lab.py: IS 0.67 -> 1.96,
+    OOS 1.49 -> 1.32, max DD -25% -> -15%); None = the original crash_short.py base."""
+    C, R = P["close"], P["close"].pct_change(fill_method=None)
+    vol = R.rolling(30, min_periods=20).std().shift(1)
+    dist = C / P["high"].rolling(365, min_periods=180).max() - 1
+    z = R / vol
+    ev = (z >= z_lo) & (z <= z_hi) & U & vol.notna() & (-dist > far_sig * vol)
+    if vol_spike is not None:
+        ev &= P["qv"] > vol_spike * P["qv"].rolling(30, min_periods=15).mean().shift(1)
+    act = ev.astype(float).rolling(hold, min_periods=1).max().fillna(0.0).where(P["qv"] > 0, 0.0)
+    sh = act.div(act.sum(axis=1).replace(0, np.nan), axis=0).fillna(0.0).clip(upper=cap)
+    m = U.astype(float)
+    m = m.div(m.sum(axis=1).replace(0, np.nan), axis=0).fillna(0.0)
+    return m.mul(sh.sum(axis=1), axis=0) - sh
+
+
 # ---------- indicators (Wilder smoothing where the original uses it) ----------
 def ema(x, n):
     return x.ewm(span=n, adjust=False, min_periods=n).mean()
@@ -221,4 +241,19 @@ if __name__ == "__main__":
     d = drop_falling_longs(w, r7).iloc[0]
     assert d["A"] == 0 and abs(d[list("BCDE")] - 0.125).max() < 1e-12, "worst 20% of longs out, rest re-weighted"
     assert (d[list("FGHIJ")] == -0.1).all() and abs(d.sum()) < 1e-12, "shorts untouched, still neutral"
+    # crash book: one -3 sigma day far below the high -> short for 21 days at the 5% cap, hedged by the EW market
+    n = 400
+    r = pd.DataFrame(0.001, index=idx[:n], columns=list("ABCDEFGHIJ"))       # the others: smooth, at their high
+    r["A"] = np.r_[np.full(300, -0.003), np.tile([0.005, -0.005], 50)]       # A bleeds to ~40% of its high, +-1 sigma
+    r.iloc[350, 0] = -3 * r["A"].iloc[320:350].std()                         # then one clean -3 sigma day
+    c = (1 + r).cumprod()
+    qv = c * 0 + 1; qv.iloc[350, 0] = 3.0                                    # the drop comes with 3x volume
+    Pc = {"close": c, "high": c, "qv": qv}
+    assert crash_short_weights({**Pc, "qv": c * 0 + 1}, c.notna() & (np.arange(n) >= 60)[:, None]).abs().sum().sum() == 0, \
+        "no volume spike -> no trade"
+    Uc = c.notna() & (np.arange(n) >= 60)[:, None]
+    cw = crash_short_weights(Pc, Uc)
+    assert abs(cw["A"].iloc[350] - (0.05 / 10 - 0.05)) < 1e-12 and abs(cw["A"].iloc[370] - cw["A"].iloc[350]) < 1e-12
+    assert cw["A"].iloc[371] == 0 and cw.iloc[349].abs().sum() == 0, "held exactly 21 days, nothing before the event"
+    assert abs(cw.sum(axis=1)).max() < 1e-12, "dollar neutral"
     print("lab selfcheck ok")

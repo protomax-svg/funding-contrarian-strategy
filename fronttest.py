@@ -34,6 +34,10 @@ HERE = Path(__file__).resolve().parent
 DB = Path(os.environ.get("FRONTTEST_DB", HERE / "fronttest.db"))
 HOST = os.environ.get("FRONTTEST_HOST", "127.0.0.1")    # 0.0.0.0 on a server behind a firewall/proxy
 PORT = int(os.environ.get("FRONTTEST_PORT", 8770))
+# "funding" = the funding-contrarian book; "crash" = crash_short.py (short sharp-drop coins, EW-hedged), run as a
+# second process with its own FRONTTEST_DB and FRONTTEST_PORT (deploy/fronttest-crash.service)
+BOOK = os.environ.get("FRONTTEST_BOOK", "funding")
+assert BOOK in ("funding", "crash"), BOOK
 START_EQUITY = 1_000.0
 FEE_BPS = 5.0                # Binance USDT-M taker fee; the spread is paid for real (buy at ask, sell at bid)
 SNAP_S = 60                  # equity row in the DB every minute (prices themselves are live, every 3 s)
@@ -138,13 +142,14 @@ def ws_loop():
         time.sleep(5)
 
 
-def build_panel(syms, now_ms):
-    """Daily closes + volume for every candidate (limit 99 -> weight 1 each, ~650 weight once a day),
-    then funding only for the coins that made the top-N (fundingRate has its own 500/5min limit)."""
+def build_panel(syms, now_ms, days=99):
+    """Daily closes + volume for every candidate (limit 99 -> weight 1 each, ~650 weight once a day; the crash book
+    needs 400 days for the 365d high -> weight 2 each, spread slower), then funding only for the coins that made
+    the top-N (fundingRate has its own 500/5min limit)."""
     close, qv, fund, high, low = {}, {}, {}, {}, {}
     start = now_ms - 12 * 86_400_000
     for s in syms:
-        k = get("/fapi/v1/klines", symbol=s, interval="1d", limit=99, endTime=now_ms - 1)
+        k = get("/fapi/v1/klines", symbol=s, interval="1d", limit=days, endTime=now_ms - 1)
         k = [r for r in k if r[6] < now_ms]                        # closed bars only
         if not k:
             continue
@@ -153,7 +158,7 @@ def build_panel(syms, now_ms):
         qv[s] = pd.Series([float(r[7]) for r in k], index=idx)
         high[s] = pd.Series([float(r[2]) for r in k], index=idx)
         low[s] = pd.Series([float(r[3]) for r in k], index=idx)
-        time.sleep(0.05)                                           # spread the weight: ~2-3 min per day
+        time.sleep(0.05 if days < 100 else 0.15)                   # spread the weight: ~2-3 min per day
     P = {"close": pd.DataFrame(close).sort_index(), "qv": pd.DataFrame(qv).sort_index(),
          "high": pd.DataFrame(high).sort_index(), "low": pd.DataFrame(low).sort_index()}
     U = lab.universe(P, top_n=TOP_N)
@@ -181,11 +186,14 @@ def market_filter(now_ms):
 
 
 def compute_signal(now_ms):
-    P = build_panel(tradable_symbols(), now_ms)
+    P = build_panel(tradable_symbols(), now_ms, days=99 if BOOK == "funding" else 400)
     U = lab.universe(P, top_n=TOP_N)
     f7 = P["funding"].rolling(LOOKBACK).mean()
     C = P["close"]
-    w = lab.drop_falling_longs(lab.xs_rank_weights(-f7, U, q=Q), C / C.shift(7) - 1, q=DROP_Q).iloc[-1]
+    if BOOK == "funding":
+        w = lab.drop_falling_longs(lab.xs_rank_weights(-f7, U, q=Q), C / C.shift(7) - 1, q=DROP_Q).iloc[-1]
+    else:
+        w = lab.crash_short_weights(P, U).iloc[-1]
     day = P["close"].index[-1]
     # market state of every top-N coin at this close, for the stats page (all from the klines already fetched)
     atr = lab.atr_pct(P["high"], P["low"], C).iloc[-1]
@@ -196,7 +204,7 @@ def compute_signal(now_ms):
     fin = lambda v, k=1.0, n=4: None if not np.isfinite(v) else round(float(v) * k, n)
     rows = []
     for s in P["close"].columns:
-        if U[s].iloc[-1]:
+        if U[s].iloc[-1] or w[s] != 0:                         # crash book: a short can outlive its top-100 slot
             rows.append({"sym": s, "f7_bps_day": round(1e4 * f7[s].iloc[-1], 3), "weight": float(w[s]),
                          "rank_vol": fin(rank[s], 1, 0), "adv30_musd": fin(adv[s], 1e-6, 2), "close": fin(C[s].iloc[-1], 1, 10),
                          "atr14_pct": fin(atr[s], 100, 3), "vol30_pct": fin(vol30[s], 100, 2),
@@ -447,7 +455,7 @@ def loop():
             # fresh DB: never trade mid-day on a stale signal; the first rebalance is the next 00:05 UTC
             set_kv("last_day", last_closed_day())
         # everything needed to audit or move the run lives in the DB itself
-        set_kv("rule", {"lookback_days": LOOKBACK, "top_n": TOP_N, "quantile": Q, "drop_falling_longs_q": DROP_Q, "fee_bps": FEE_BPS, "fills": "buy at ask, sell at bid (bookTicker)",
+        set_kv("rule", {"lookback_days": LOOKBACK, "top_n": TOP_N, "book": BOOK, "quantile": Q, "drop_falling_longs_q": DROP_Q, "fee_bps": FEE_BPS, "fills": "buy at ask, sell at bid (bookTicker)",
                         "start_equity": START_EQUITY, "candidates": "all USDT-M perps with underlyingType COIN",
                         "atr_filter_shadow": {"off_below_pct": ATR_OFF_BELOW, "window_days": 365, "atr_n": 14},
                         "trend_filter_shadow": {"off_above_pct": TREND_OFF_ABOVE, "sma": 200, "window_days": 365}})
@@ -512,7 +520,7 @@ def api_stats():
         started = kv("started")
     ro = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
     try:
-        out = stats.compute(ro, px, START_EQUITY, eq)
+        out = stats.compute(ro, px, START_EQUITY, eq, BOOK)
     finally:
         ro.close()
     out.update({"now": now_ms(), "started": started, "start_equity": START_EQUITY, "equity": eq})
@@ -550,7 +558,7 @@ def api_state():
                 "feed": {"ws_age_s": round(time.time() - WS["ts"], 1) if WS["ts"] else None,
                          "ws_reconnects": WS["reconnects"], "rest_calls_1h": len(REST["calls"]),
                          "ip_weight_1m": REST["ip_weight_1m"]},
-                "rule": {"lookback_days": LOOKBACK, "top_n": TOP_N, "quantile": Q, "drop_falling_longs_q": DROP_Q, "fee_bps": FEE_BPS},
+                "rule": {"lookback_days": LOOKBACK, "top_n": TOP_N, "book": BOOK, "quantile": Q, "drop_falling_longs_q": DROP_Q, "fee_bps": FEE_BPS},
                 "filter_history": q("select day, btc_atr_pct, btc_trend_pct, atr_on, trend_on_shadow from filters order by ts desc limit 60"),
                 "working": q("select sym, qty, kind, status, limit_px, moves, created, spread0_bps from orders "
                              "where status not in ('filled_maker','filled_taker','skipped') order by created")}
@@ -681,6 +689,9 @@ if __name__ == "__main__":
         with sqlite3.connect(dst) as out:
             CON.backup(out)
         print("backed up to", dst); raise SystemExit
+    old = kv("rule")
+    if old and old.get("book", "funding") != BOOK:            # never run one book's rule on the other book's DB
+        raise SystemExit(f"{DB} holds the {old.get('book', 'funding')!r} book, FRONTTEST_BOOK is {BOOK!r}")
     threading.Thread(target=ws_loop, daemon=True).start()
     threading.Thread(target=loop, daemon=True).start()
     print(f"fronttest UI on http://{HOST}:{PORT}  db={DB}", flush=True)

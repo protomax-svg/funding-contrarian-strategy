@@ -10,11 +10,14 @@ Checks
  4 lookahead  signal day = the UTC day that closed before the rebalance; saved close = Binance's daily close of that day;
               7d funding re-computed from raw events that happened before the rebalance
  5 rule       at each rebalance: longs = lowest 7d funding, shorts = highest, ~20% each side, equal size, dollar neutral
+              (crash book: longs equal size, no short above the 5% cap, dollar neutral, and for up to 3 shorts the
+              sharp-drop + volume-spike event itself is re-derived from 420 days of raw daily klines)
 REST use: ~1 weight per trade (1m klines) + fundingRate calls (separate 500/5min pool). Throttled.
 """
 import calendar
 import json
 import sqlite3
+import statistics
 import sys
 import time
 import urllib.parse
@@ -22,6 +25,7 @@ import urllib.request
 from collections import defaultdict
 
 API = "https://fapi.binance.com"
+CRASH = False                # set in main() from the DB's rule: which book this DB trades
 DAY = 86_400_000
 
 
@@ -37,6 +41,25 @@ def get(path, **p):
             time.sleep(2 * (i + 1))
 
 
+def crash_event(s, dts, z_lo=-4.2, z_hi=-2.2, hold=21, far_sig=3.3, spike=2.0):
+    """True if s had a z_lo..z_hi sigma day (vs the 30 daily returns before it) more than far_sig sigma below its
+    365d high, on quote volume > spike x its 30d average, in the `hold` days up to the signal day dts.
+    Plain Python, from Binance daily klines."""
+    k = [r for r in get("/fapi/v1/klines", symbol=s, interval="1d", endTime=dts + DAY - 1, limit=420) if r[0] <= dts]
+    c, h, qv = [float(r[4]) for r in k], [float(r[2]) for r in k], [float(r[7]) for r in k]
+    ret = [None] + [c[i] / c[i - 1] - 1 for i in range(1, len(c))]
+    for i in range(max(1, len(k) - hold), len(k)):
+        prev = [x for x in ret[max(0, i - 30):i] if x is not None]
+        win = h[max(0, i - 364):i + 1]
+        qprev = qv[max(0, i - 30):i]
+        if len(prev) < 20 or len(win) < 180 or len(qprev) < 15 or qv[i] <= spike * sum(qprev) / len(qprev):
+            continue
+        vol = statistics.stdev(prev)
+        if vol > 0 and z_lo <= ret[i] / vol <= z_hi and -(c[i] / max(win) - 1) > far_sig * vol:
+            return True
+    return False
+
+
 def main(db):
     con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
     kv = {k: json.loads(v) for k, v in con.execute("select k, v from kv")}
@@ -44,6 +67,8 @@ def main(db):
     fund = con.execute("select ts, sym, rate, mark, payment from funding order by ts").fetchall()
     reb = con.execute("select ts, day from rebalances order by ts").fetchall()
     start_eq = kv.get("rule", {}).get("start_equity", 1000.0)
+    global CRASH
+    CRASH = kv.get("rule", {}).get("book", "funding") == "crash"
     ok = True
     print(f"DB {db}: {len(trades)} trades, {len(fund)} funding rows, {len(reb)} rebalances\n")
 
@@ -144,16 +169,26 @@ def main(db):
         sig = con.execute("select sym, f7_bps_day, weight from signals where ts=?", (ts,)).fetchall()
         L = [r for r in sig if r[2] > 0]
         S = [r for r in sig if r[2] < 0]
-        rule_ok = bool(sig) and (not L or not S or max(r[1] for r in L) <= min(r[1] for r in S))
-        sizes = {round(abs(r[2]), 6) for r in L + S}
         neutral = abs(sum(r[2] for r in L + S)) < 2e-3        # older DBs stored weights rounded to 4 decimals
         line = (f"4 LOOKAHEAD rebalance {day}+1 at +{lag_h:.2f}h after the close "
-                f"{'OK' if 0 < lag_h < 24 else 'BAD'} | 5 RULE {len(sig)} coins, {len(L)} long / {len(S)} short, "
-                f"long f7 <= short f7: {rule_ok}, equal size: {len(sizes) <= 2}, net {sum(r[2] for r in L + S):+.4f}")
+                f"{'OK' if 0 < lag_h < 24 else 'BAD'} | 5 RULE {len(sig)} coins, {len(L)} long / {len(S)} short, ")
+        if CRASH:
+            # longs = the equal-weight market (a shorted coin nets its market slice), shorts capped at 5 %
+            longs_eq = len({round(r[2], 9) for r in L}) <= 1
+            cap_ok = all(r[2] >= -0.05 - 1e-9 for r in S)
+            probe = sorted(S, key=lambda r: r[2])[:3]
+            ev_ok = all(crash_event(r[0], dts) for r in probe)
+            rule_ok = longs_eq and cap_ok and ev_ok
+            line += (f"longs equal: {longs_eq}, shorts <= 5%: {cap_ok}, sharp-drop event re-derived for "
+                     f"{len(probe)} biggest shorts: {ev_ok}, net {sum(r[2] for r in L + S):+.4f}")
+        else:
+            rule_ok = bool(sig) and (not L or not S or max(r[1] for r in L) <= min(r[1] for r in S))
+            sizes = {round(abs(r[2]), 6) for r in L + S}
+            line += f"long f7 <= short f7: {rule_ok}, equal size: {len(sizes) <= 2}, net {sum(r[2] for r in L + S):+.4f}"
         ok &= 0 < lag_h < 24 and rule_ok and neutral
         # since 2026-09-28 the worst-7d-return longs are dropped: every low-funding coin left out must have fallen
         # more than every long kept (features.ret7d_pct is computed from the saved closes checked below)
-        if has_feat and L:
+        if has_feat and L and not CRASH:
             r7 = {s: v for s, v in con.execute("select sym, ret7d_pct from features where ts=?", (ts,)) if v is not None}
             maxf = max(r[1] for r in L)
             dropped = [r[0] for r in sig if r[2] == 0 and r[1] < maxf]
@@ -185,14 +220,15 @@ def main(db):
             errs = []
             for s, f7, _ in probe:
                 k = get("/fapi/v1/klines", symbol=s, interval="1d", startTime=dts, limit=1)
-                row = con.execute("select close from features where ts=? and sym=?", (ts, s)).fetchone()
+                row = con.execute("select close, rank_vol from features where ts=? and sym=?", (ts, s)).fetchone()
                 if k and row and row[0] and abs(float(k[0][4]) / row[0] - 1) > 1e-9:
                     errs.append(f"{s} close saved {row[0]} vs Binance {k[0][4]}")
                 ev = get("/fapi/v1/fundingRate", symbol=s, startTime=dts - 7 * DAY, endTime=ts, limit=1000)
                 # bucket like the strategy: an event at 00:00:00.004 belongs to the day that just closed
                 tot = sum(float(e["fundingRate"]) for e in ev
                           if dts - 6 * DAY <= (int(e["fundingTime"]) // 60_000 * 60_000 - 60_000) < dts + DAY)
-                if abs(1e4 * tot / 7 - f7) > 1e-3:
+                # crash book: a short that left the top-100 has no funding download (saved f7 = 0), nothing to compare
+                if abs(1e4 * tot / 7 - f7) > 1e-3 and not (CRASH and row and row[1] is None):
                     errs.append(f"{s} f7 saved {f7:.4f} vs re-derived {1e4 * tot / 7:.4f} bps/day")
             line += " | re-derived close + 7d funding: " + ("OK" if not errs else "; ".join(errs))
             ok &= not errs

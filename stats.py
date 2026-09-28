@@ -10,9 +10,12 @@ import math
 import numpy as np
 import pandas as pd
 
-# backtest reference for the live rule (ret7_test.py: top-100 + lab.drop_falling_longs, 2024-01..2026-08, 1x)
-BACKTEST = {"sharpe": 1.27, "ann_return_pct": 43.5, "daily_mean_pct": 0.119, "daily_std_pct": 1.80,
-            "worst_day_pct": -9.2, "max_dd_pct": -28.3, "price_pct_yr": -11.0, "funding_pct_yr": 62.7, "cost_pct_yr": 8.2}
+# backtest reference per book, 2024-01..2026-08, 1x
+BACKTEST = {  # funding: ret7_test.py (top-100 + lab.drop_falling_longs); crash: lab.crash_short_weights with the volume spike (crash_lab.py)
+    "funding": {"sharpe": 1.27, "ann_return_pct": 43.5, "daily_mean_pct": 0.119, "daily_std_pct": 1.80,
+                "worst_day_pct": -9.2, "max_dd_pct": -28.3, "price_pct_yr": -11.0, "funding_pct_yr": 62.7, "cost_pct_yr": 8.2},
+    "crash": {"sharpe": 1.32, "ann_return_pct": 21.5, "daily_mean_pct": 0.059, "daily_std_pct": 0.85,
+              "worst_day_pct": -8.4, "max_dd_pct": -15.2, "price_pct_yr": 22.9, "funding_pct_yr": -0.1, "cost_pct_yr": 1.4}}
 EPS = 1e-12
 
 
@@ -220,7 +223,7 @@ def execution(con):
     return summ, o.sort_values("created", ascending=False)
 
 
-def compute(con, marks_now, start_equity, equity_now):
+def compute(con, marks_now, start_equity, equity_now, book="funding"):
     E = episodes(con, marks_now)
     D, dsum = daily(con, start_equity)
     ex_sum, ex_orders = execution(con)
@@ -236,7 +239,7 @@ def compute(con, marks_now, start_equity, equity_now):
     parts["funding_not_in_a_trade"] = total_fund - parts["funding"]
     clean = lambda df: [] if df is None or len(df) == 0 else \
         [{k: (None if isinstance(v, float) and not math.isfinite(v) else v) for k, v in r.items()} for r in df.to_dict("records")]
-    return {"totals": parts, "daily_summary": dsum, "backtest": BACKTEST,
+    return {"totals": parts, "daily_summary": dsum, "backtest": BACKTEST[book],
             "sides": clean(per_side(E)) if len(E) else [], "coins": clean(per_coin(E)) if len(E) else [],
             "episodes": clean(E.sort_values("open_ts", ascending=False)) if len(E) else [], "daily": clean(D),
             "execution": ex_sum, "orders": clean(ex_orders.head(500)) if len(ex_orders) else []}

@@ -33,7 +33,7 @@ th{color:var(--mute);font-weight:500;font-size:12px}
 <body>
 <main>
   <nav style="margin-bottom:10px"><a href="/stats" style="color:var(--acc);text-decoration:none">Statistics per coin →</a></nav>
-  <h1>Funding contrarian — paper fronttest</h1>
+  <h1 id="h1">Funding contrarian — paper fronttest</h1>
   <p class="sub" id="sub">loading…</p>
 
   <div class="card" id="filt" style="margin-bottom:14px"></div>
@@ -102,8 +102,11 @@ async function refresh(){
   const lng = s.positions.filter(p => p.qty > 0).reduce((a,p) => a + p.notional, 0);
   const sht = s.positions.filter(p => p.qty < 0).reduce((a,p) => a + p.notional, 0);
   const mins = Math.max(0, Math.round((s.next_rebalance - s.now)/6e4));
+  if (s.rule.book === "crash") { $("h1").textContent = "Crash short — paper fronttest"; document.title = "Crash Fronttest"; }
   $("sub").textContent = `Running ${days.toFixed(1)} days · signal day ${s.last_day ?? "–"} · next rebalance in ${Math.floor(mins/60)}h ${mins%60}m (00:05 UTC) · ` +
-    `rule: top-${s.rule.top_n}, ${s.rule.lookback_days}d funding, ${s.rule.quantile*100}% each side, fills at bid/ask + ${s.rule.fee_bps} bps fee` +
+    (s.rule.book === "crash"
+      ? `rule: CRASH book — short top-${s.rule.top_n} coins after a -2.2..-4.2σ day on 2x+ volume far from the 365d high, 21d, max 5% each, long the equal-weight top-${s.rule.top_n}, fills at bid/ask + ${s.rule.fee_bps} bps fee`
+      : `rule: top-${s.rule.top_n}, ${s.rule.lookback_days}d funding, ${s.rule.quantile*100}% each side, fills at bid/ask + ${s.rule.fee_bps} bps fee`) +
     ` · feed: websocket ${s.feed.ws_age_s == null ? "connecting" : s.feed.ws_age_s < 60 ? "live" : "STALE " + s.feed.ws_age_s + "s"}` +
     `, our REST calls last hour ${s.feed.rest_calls_1h}, IP weight ${s.feed.ip_weight_1m ?? "–"}/2400`;
   const k = [["Equity", usd(eq), ""], ["P&L", usd(pnl), sgn(pnl)],

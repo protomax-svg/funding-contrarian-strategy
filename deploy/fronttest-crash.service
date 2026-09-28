@@ -1,0 +1,20 @@
+# systemd unit for a server. Copy to /etc/systemd/system/, edit User and paths, then:
+#   sudo systemctl daemon-reload && sudo systemctl enable --now fronttest-crash
+[Unit]
+Description=Crash-short paper fronttest (second book, crash_short.py)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=trader
+WorkingDirectory=/opt/reddit-ideas
+Environment=FRONTTEST_DB=/opt/reddit-ideas/fronttest_crash.db
+Environment=FRONTTEST_HOST=127.0.0.1
+Environment=FRONTTEST_PORT=8771
+Environment=FRONTTEST_BOOK=crash
+ExecStart=/opt/reddit-ideas/.venv/bin/python fronttest.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

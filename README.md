@@ -116,6 +116,32 @@ Also better on top-30 and top-50; all 28 lookback × cutoff cells OOS 1.01-1.57;
 costs +2 %/yr, daily vol 1.37 → 1.80 %. Found after looking at 2024-26, so treat the OOS gain as optimistic.
 Banning coins that were bad in past years does nothing (coin P&L year-to-year rank corr ≈ 0).
 
+## Second fronttest book: crash short (since 2026-09-28)
+
+`FRONTTEST_BOOK=crash` runs `lab.crash_short_weights` (= `crash_short.py` post-like base, checked equal to 0.0, **plus the volume-spike
+filter from `crash_lab.py`**: only drops on > 2x the 30d average quote volume; backtest IS 1.96, OOS 1.32, max DD −15%, ~6 shorts,
+no position on 9% of days) as a separate
+paper book with its own DB and port: `deploy/fronttest-crash.service` (`fronttest_crash.db`, port 8771). Same executor,
+funding, stats page and audit; the audit re-derives the sharp-drop event of the 3 biggest shorts from raw klines.
+A DB refuses to start with the other book's rule. Live check on 2026-09-27 (before the volume filter): 14 shorts, all 14 events re-derived.
+
+## Crash book: filters, exits, sizing, hedges (`crash_lab.py` → `results_crash_lab.md`)
+
+22 one-change variants, fixed before running. Sharpe:
+
+| Variant | IS | OOS | +1d | Max DD | Events kept |
+|---|---|---|---|---|---|
+| base (crash_short.py) | 0.67 | 1.49 | 1.87 | −25% | 100% |
+| **volume spike on the drop day (> 2x 30d avg)** — IS-best, **live** | **1.96** | 1.32 | 1.64 | **−15%** | 22% |
+| market vol top third | 1.49 | 1.19 | 1.14 | −9% | 32% |
+| market vol low (below median) | −0.85 | 1.28 | 1.84 | −31% | 56% |
+| squeeze stop +30% / +50% | 0.45 / 0.81 | 0.64 / 0.86 | | −28% | |
+| hedge top-10 instead of top-100 | −0.62 | 1.83 | | −59% | |
+
+High-vol / volume-spike entries make the book much steadier in 2020-23 and keep OOS above 1.2 with half the drawdown,
+at about half the capital in use. Stops hurt. IS vs OOS rank correlation across variants is −0.45: the base's own OOS is
+inflated (it was found on OOS), so "beats the base OOS" is a biased yardstick.
+
 ## Idea #19: buy the dip near the 52-week high (`dip52.py` → `results_dip52.md`, `crash_short.py` → `results_crash_short.md`)
 
 Source: r/algotrading 1tzicir (QQQ: a sharp one-day drop near the 52w high recovers, +4.7% in 3 months, N=20).
